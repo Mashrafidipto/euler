@@ -1,9 +1,10 @@
 # Euler 📁
 There are millions of terminal that uses vim keys but I feel like some parts are missing. So I am trying to create a file manager that acts like a neovim buffer . It takes inspirations from *mini.files*  and *oil.nvim* . I *use mini.fils* heavily in my work so I created this. This is mostly AI genarated now but I plan to read the code and fix any problem that might come or not I don't know. Let's see how this goes from now on.
 
-# Why name is Euler?
+# Why the name is Euler?
 It's play on the word oil and tibiute [Leonhard Euler](https://en.wikipedia.org/wiki/Leonhard_Euler) .
 
+---
 * The billow part is AI genarated .
 ---
 A modern, buffer-centric terminal file manager written in Rust, inspired by the core philosophy of [oil.nvim](https://github.com/stevearc/oil.nvim): **edit your filesystem like a normal text buffer**.
