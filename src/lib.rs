@@ -22,7 +22,8 @@ Usage:
 
 Keybindings (Normal Mode):
     h                   Navigate to parent directory (..)
-    l, <Enter>          Enter directory / open file in $EDITOR
+    l                   Enter directory / open file in xdg-open
+    <Enter>             Enter directory / open file in $EDITOR
     j, k                Move cursor down / up (Arrow keys disabled)
     w, b                Jump word forward / backward
     0, $                Jump to start / end of filename

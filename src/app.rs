@@ -286,8 +286,8 @@ impl App {
                 }
             }
 
-            // Move to child column (right) or open file
-            KeyCode::Char('l') | KeyCode::Enter => {
+            // Move to child column (right) or open file with xdg-open
+            KeyCode::Char('l') => {
                 let active = &self.columns[self.active_col];
                 if let Some(line) = active.current_line() {
                     let target_path = active.current_dir.join(line.clean_name());
@@ -297,17 +297,41 @@ impl App {
                             // Focus existing child column
                             self.active_col += 1;
                             self.ensure_child_preview();
-                        } else {
-                            // Load and push child column
-                            if let Ok(buf) = DirectoryBuffer::load(
-                                &target_path,
-                                self.config.show_hidden,
-                                self.config.natural_sort,
-                            ) {
-                                self.columns.push(buf);
-                                self.active_col += 1;
-                                self.ensure_child_preview();
-                            }
+                        } else if let Ok(buf) = DirectoryBuffer::load(
+                            &target_path,
+                            self.config.show_hidden,
+                            self.config.natural_sort,
+                        ) {
+                            self.columns.push(buf);
+                            self.active_col += 1;
+                            self.ensure_child_preview();
+                        }
+                    } else {
+                        // Open file in system opener (xdg-open)
+                        self.open_with_system_opener()?;
+                    }
+                }
+            }
+
+            // Move to child column (right) or open file in $EDITOR
+            KeyCode::Enter => {
+                let active = &self.columns[self.active_col];
+                if let Some(line) = active.current_line() {
+                    let target_path = active.current_dir.join(line.clean_name());
+                    if line.is_dir() {
+                        let next_col = self.active_col + 1;
+                        if next_col < self.columns.len() {
+                            // Focus existing child column
+                            self.active_col += 1;
+                            self.ensure_child_preview();
+                        } else if let Ok(buf) = DirectoryBuffer::load(
+                            &target_path,
+                            self.config.show_hidden,
+                            self.config.natural_sort,
+                        ) {
+                            self.columns.push(buf);
+                            self.active_col += 1;
+                            self.ensure_child_preview();
                         }
                     } else {
                         // Open file in user's $EDITOR

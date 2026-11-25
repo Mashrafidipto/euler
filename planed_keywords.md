@@ -11,7 +11,8 @@ Normal Mode is the primary navigation and command mode.
 | Key / Keyword | Category | Planned Action | Notes / Oil.nvim Equivalent |
 | :--- | :--- | :--- | :--- |
 | **`h`** | Directory Navigation | **Move to parent / previous directory column (left)** | Freely navigates left; all in-flight edits preserved in memory |
-| **`l`** | Directory Navigation | **Enter directory column (right) / Open file** in `$EDITOR` | Opens/focuses adjacent column or opens file |
+| **`l`** | Directory Navigation | **Enter directory column (right) / Open file with `xdg-open`** | Focuses adjacent column or opens file with system default app |
+| **`<Enter>`** | Directory Navigation | **Enter directory column (right) / Open file in `$EDITOR`** | Focuses adjacent column or opens file in user's `$EDITOR` |
 | **`j`** | Navigation | Move cursor down one line | Standard Vim motion |
 | **`k`** | Navigation | Move cursor up one line | Standard Vim motion |
 | **`w`** | Navigation | Jump forward to the start of the next word | In filename |

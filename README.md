@@ -24,7 +24,8 @@ Instead of interacting with files through rigid cursor selection and single-item
 - **Filesystem Undo / Redo:** Use `u` in Normal mode to roll back committed filesystem batches.
 - **Strict Vim Navigation:**
   - `h` navigates to the previous / parent directory (`..`).
-  - `l` or `<Enter>` enters a directory or opens a file in `$EDITOR`.
+  - `l` enters a directory or opens a file with `xdg-open`.
+  - `<Enter>` enters a directory or opens a file in `$EDITOR`.
   - All arrow keys are explicitly disabled.
   - Hyphen (`-`) is inert.
   - `gx` opens the target with `xdg-open` (system default application).

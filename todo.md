@@ -1,2 +1,2 @@
 1. - [x] make a small named binary el.
-1. - [ ] l open files in xdg-open.
+1. - [x] l open files in xdg-open.
