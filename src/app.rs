@@ -1,34 +1,51 @@
-//! Application controller: owns global state and orchestrates user input.
+//! Application controller: owns multi-column directory state and handles user input.
 
-use crate::buffer::DirectoryBuffer;
+use crate::buffer::{BufferLine, DirectoryBuffer};
 use crate::config::Config;
-use crate::engine::{compute_diff, execute_plan, FsPlan, UndoStack};
+use crate::engine::{compute_diff, execute_plan, FsAction, FsPlan, UndoStack};
 use crate::input::Mode;
 use crate::ui::Terminal;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+const MAX_COLUMNS: usize = 4;
+
+/// An item stored in the Euler clipboard from a delete (cut) or yank (copy) operation.
+#[derive(Debug, Clone)]
+pub struct ClipboardItem {
+    pub line: BufferLine,
+    pub is_cut: bool,
+}
+
 pub struct App {
-    pub buffer: DirectoryBuffer,
+    /// Active directory columns open side-by-side (up to 4 in a row like mini.files).
+    pub columns: Vec<DirectoryBuffer>,
+
+    /// Index of the currently focused column (0 <= active_col < columns.len()).
+    pub active_col: usize,
+
     pub config: Config,
     pub mode: Mode,
     pub pending_plan: Option<FsPlan>,
     pub undo_stack: UndoStack,
-    pub clipboard: Vec<String>,
+    pub clipboard: Vec<ClipboardItem>,
     pub search_query: Option<String>,
     pub status_msg: Option<(String, Instant)>,
     pub should_quit: bool,
+    pub quit_after_confirm: bool,
 }
 
 impl App {
-    /// Initialize Euler on a target directory.
+    /// Initialize Euler on a target directory, loading multi-column preview.
     pub fn new(path: &Path, config: Config) -> Result<Self> {
-        let buffer = DirectoryBuffer::load(path, config.show_hidden, config.natural_sort)?;
-        Ok(Self {
-            buffer,
+        let root_buffer = DirectoryBuffer::load(path, config.show_hidden, config.natural_sort)?;
+        let mut app = Self {
+            columns: vec![root_buffer],
+            active_col: 0,
             config,
             mode: Mode::Normal,
             pending_plan: None,
@@ -37,7 +54,23 @@ impl App {
             search_query: None,
             status_msg: None,
             should_quit: false,
-        })
+            quit_after_confirm: false,
+        };
+
+        // Open child directory in the next column if cursor is on a directory
+        app.ensure_child_preview();
+
+        Ok(app)
+    }
+
+    /// Reference to the currently active directory buffer.
+    pub fn active_buffer(&self) -> &DirectoryBuffer {
+        &self.columns[self.active_col]
+    }
+
+    /// Mutable reference to the currently active directory buffer.
+    pub fn active_buffer_mut(&mut self) -> &mut DirectoryBuffer {
+        &mut self.columns[self.active_col]
     }
 
     /// Set a temporary status message to be displayed in the bottom bar.
@@ -55,17 +88,76 @@ impl App {
         self.status_msg.as_ref().map(|(msg, _)| msg.clone())
     }
 
-    /// Main application loop with event-driven rendering (0% idle CPU and zero tearing).
+    /// Ensure the column to the right shows the directory under the active cursor.
+    fn ensure_child_preview(&mut self) {
+        if self.active_col >= self.columns.len() {
+            return;
+        }
+
+        let child_path_opt = {
+            let active = &self.columns[self.active_col];
+            if let Some(line) = active.current_line() {
+                if line.is_dir() {
+                    Some(active.current_dir.join(line.clean_name()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(child_path) = child_path_opt {
+            if child_path.is_dir() {
+                let next_col = self.active_col + 1;
+                if next_col < self.columns.len() {
+                    // Update next column if its path changed and it's not modified
+                    if self.columns[next_col].current_dir != child_path
+                        && !self.columns[next_col].is_dirty()
+                    {
+                        if let Ok(buf) = DirectoryBuffer::load(
+                            &child_path,
+                            self.config.show_hidden,
+                            self.config.natural_sort,
+                        ) {
+                            self.columns[next_col] = buf;
+                            // Clean up stale grandchild columns if not modified
+                            if next_col + 1 < self.columns.len()
+                                && !self.columns[next_col + 1].is_dirty()
+                            {
+                                self.columns.truncate(next_col + 1);
+                            }
+                        }
+                    }
+                } else if self.columns.len() < MAX_COLUMNS {
+                    // Open as new adjacent column
+                    if let Ok(buf) = DirectoryBuffer::load(
+                        &child_path,
+                        self.config.show_hidden,
+                        self.config.natural_sort,
+                    ) {
+                        self.columns.push(buf);
+                    }
+                }
+            }
+        }
+        // Note: When cursor is on a file (child_path_opt is None), do NOT close
+        // or truncate adjacent columns. Keep open folders viewable side-by-side.
+        // Adjacent columns are only updated when the cursor moves to a new folder.
+    }
+
+    /// Main application loop with event-driven rendering.
     pub fn run(&mut self, terminal: &mut Terminal) -> Result<()> {
         let mut needs_render = true;
 
         while !self.should_quit {
             let status_msg = self.current_status();
 
-            // Only redraw when state has actually changed or on window resize
             if needs_render {
+                terminal.cursorline = self.config.cursorline;
                 terminal.render(
-                    &mut self.buffer,
+                    &mut self.columns,
+                    self.active_col,
                     &self.mode,
                     self.pending_plan.as_ref(),
                     status_msg.as_deref(),
@@ -73,7 +165,6 @@ impl App {
                 needs_render = false;
             }
 
-            // If a status message is active, poll briefly so it can expire; otherwise wait for input
             let poll_duration = if self.status_msg.is_some() {
                 Duration::from_millis(150)
             } else {
@@ -94,7 +185,6 @@ impl App {
                     _ => {}
                 }
             } else if self.status_msg.is_some() {
-                // Status message might have expired, trigger re-render
                 needs_render = true;
             }
         }
@@ -137,11 +227,6 @@ impl App {
                 let s = *scroll;
                 self.handle_help_modal(key, s)?;
             }
-            Mode::DirtyNavPrompt { target, is_parent } => {
-                let t = target.clone();
-                let p = *is_parent;
-                self.handle_dirty_prompt(key, t, p)?;
-            }
         }
 
         Ok(())
@@ -152,35 +237,77 @@ impl App {
     /// Normal Mode event dispatching.
     fn handle_normal_mode(&mut self, key: KeyEvent, terminal: &mut Terminal) -> Result<()> {
         match key.code {
-            // Directory Traversal: 'h' moves to parent directory (..)
+            // Move to previous / parent column (left) without requiring save!
             KeyCode::Char('h') => {
-                let parent = self.buffer.current_dir.parent().map(|p| p.to_path_buf());
-                if let Some(parent_path) = parent {
-                    if self.buffer.is_dirty() {
-                        self.mode = Mode::DirtyNavPrompt {
-                            target: parent_path,
-                            is_parent: true,
-                        };
-                    } else {
-                        self.navigate_to(parent_path)?;
-                    }
+                if self.active_col > 0 {
+                    // Move focus to left column; edits in current column are preserved in memory!
+                    self.active_col -= 1;
                 } else {
-                    self.set_status("Already at root directory.");
+                    // Leftmost column: load parent directory as new leftmost column
+                    let parent_opt = self.columns[0]
+                        .current_dir
+                        .parent()
+                        .map(|p| p.to_path_buf());
+
+                    if let Some(parent_path) = parent_opt {
+                        let current_folder_name = self.columns[0]
+                            .current_dir
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default();
+
+                        if let Ok(mut parent_buf) = DirectoryBuffer::load(
+                            &parent_path,
+                            self.config.show_hidden,
+                            self.config.natural_sort,
+                        ) {
+                            // Position cursor in parent onto the folder we just came from
+                            if let Some(pos) = parent_buf
+                                .lines
+                                .iter()
+                                .position(|l| l.clean_name() == current_folder_name)
+                            {
+                                parent_buf.cursor_row = pos;
+                                parent_buf.clamp_cursor_normal();
+                            }
+
+                            self.columns.insert(0, parent_buf);
+                            // Keep max columns within bounds if rightmost column is not modified
+                            if self.columns.len() > MAX_COLUMNS
+                                && self.columns.last().map(|c| !c.is_dirty()).unwrap_or(false)
+                            {
+                                self.columns.pop();
+                            }
+                            self.active_col = 0;
+                        }
+                    } else {
+                        self.set_status("Already at root directory.");
+                    }
                 }
             }
 
-            // Directory Traversal: 'l' or Enter enters directory / opens file
+            // Move to child column (right) or open file
             KeyCode::Char('l') | KeyCode::Enter => {
-                if let Some(line) = self.buffer.current_line() {
-                    let target_path = self.buffer.current_dir.join(line.clean_name());
+                let active = &self.columns[self.active_col];
+                if let Some(line) = active.current_line() {
+                    let target_path = active.current_dir.join(line.clean_name());
                     if line.is_dir() {
-                        if self.buffer.is_dirty() {
-                            self.mode = Mode::DirtyNavPrompt {
-                                target: target_path,
-                                is_parent: false,
-                            };
+                        let next_col = self.active_col + 1;
+                        if next_col < self.columns.len() {
+                            // Focus existing child column
+                            self.active_col += 1;
+                            self.ensure_child_preview();
                         } else {
-                            self.navigate_to(target_path)?;
+                            // Load and push child column
+                            if let Ok(buf) = DirectoryBuffer::load(
+                                &target_path,
+                                self.config.show_hidden,
+                                self.config.natural_sort,
+                            ) {
+                                self.columns.push(buf);
+                                self.active_col += 1;
+                                self.ensure_child_preview();
+                            }
                         }
                     } else {
                         // Open file in user's $EDITOR
@@ -189,36 +316,43 @@ impl App {
                 }
             }
 
-            // Hyphen is disabled by user specification
-            KeyCode::Char('-') => {
-                // Do nothing
-            }
+            // Hyphen is disabled by specification
+            KeyCode::Char('-') => {}
 
-            // Open with xdg-open: 'gx'
+            // Delete character under cursor: 'x'
             KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::NONE) => {
-                // Single 'x' deletes char under cursor
-                self.buffer.delete_char_under();
+                self.active_buffer_mut().delete_char_under();
             }
 
             // 'g' prefix chords
             KeyCode::Char('g') => {
-                // Wait for next key chord
                 if let Ok(Event::Key(next)) = event::read() {
                     if next.kind == KeyEventKind::Press {
                         match next.code {
-                            // 'gg' jumps to top of buffer
                             KeyCode::Char('g') => {
-                                self.buffer.cursor_row = 0;
-                                self.buffer.clamp_cursor_normal();
+                                self.active_buffer_mut().cursor_row = 0;
+                                self.active_buffer_mut().clamp_cursor_normal();
+                                self.ensure_child_preview();
                             }
-                            // 'g.' toggles hidden files
                             KeyCode::Char('.') => {
                                 self.config.show_hidden = !self.config.show_hidden;
-                                self.buffer.reload(self.config.show_hidden, self.config.natural_sort)?;
-                                let state = if self.config.show_hidden { "visible" } else { "hidden" };
+                                // Reload clean columns with new hidden setting
+                                for col in &mut self.columns {
+                                    if !col.is_dirty() {
+                                        let _ = col.reload(
+                                            self.config.show_hidden,
+                                            self.config.natural_sort,
+                                        );
+                                    }
+                                }
+                                let state = if self.config.show_hidden {
+                                    "visible"
+                                } else {
+                                    "hidden"
+                                };
                                 self.set_status(format!("Dotfiles are now {}", state));
+                                self.ensure_child_preview();
                             }
-                            // 'gx' opens target with xdg-open
                             KeyCode::Char('x') => {
                                 self.open_with_system_opener()?;
                             }
@@ -230,106 +364,117 @@ impl App {
 
             // Vertical Motions: 'j' and 'k'
             KeyCode::Char('j') => {
-                if !self.buffer.lines.is_empty() {
-                    self.buffer.cursor_row = (self.buffer.cursor_row + 1).min(self.buffer.lines.len() - 1);
-                    self.buffer.clamp_cursor_normal();
+                let total = self.active_buffer().lines.len();
+                if total > 0 {
+                    self.active_buffer_mut().cursor_row =
+                        (self.active_buffer().cursor_row + 1).min(total - 1);
+                    self.active_buffer_mut().clamp_cursor_normal();
+                    self.ensure_child_preview();
                 }
             }
             KeyCode::Char('k') => {
-                self.buffer.cursor_row = self.buffer.cursor_row.saturating_sub(1);
-                self.buffer.clamp_cursor_normal();
+                self.active_buffer_mut().cursor_row =
+                    self.active_buffer().cursor_row.saturating_sub(1);
+                self.active_buffer_mut().clamp_cursor_normal();
+                self.ensure_child_preview();
             }
 
             // Horizontal Motions: 'w', 'b', '0', '$'
             KeyCode::Char('w') => {
-                if let Some(line) = self.buffer.current_line() {
+                let col = self.active_buffer().cursor_col;
+                if let Some(line) = self.active_buffer().current_line() {
                     let chars: Vec<char> = line.text.chars().collect();
-                    let mut col = self.buffer.cursor_col;
-                    // Jump past current word
-                    while col < chars.len() && !chars[col].is_whitespace() {
-                        col += 1;
+                    let mut new_col = col;
+                    while new_col < chars.len() && !chars[new_col].is_whitespace() {
+                        new_col += 1;
                     }
-                    // Jump past whitespace to next word
-                    while col < chars.len() && chars[col].is_whitespace() {
-                        col += 1;
+                    while new_col < chars.len() && chars[new_col].is_whitespace() {
+                        new_col += 1;
                     }
-                    self.buffer.cursor_col = col;
-                    self.buffer.clamp_cursor_normal();
+                    self.active_buffer_mut().cursor_col = new_col;
+                    self.active_buffer_mut().clamp_cursor_normal();
                 }
             }
             KeyCode::Char('b') => {
-                if let Some(line) = self.buffer.current_line() {
+                let col = self.active_buffer().cursor_col;
+                if let Some(line) = self.active_buffer().current_line() {
                     let chars: Vec<char> = line.text.chars().collect();
-                    let mut col = self.buffer.cursor_col;
-                    if col > 0 {
-                        col -= 1;
-                        while col > 0 && chars[col].is_whitespace() {
-                            col -= 1;
+                    let mut new_col = col;
+                    if new_col > 0 {
+                        new_col -= 1;
+                        while new_col > 0 && chars[new_col].is_whitespace() {
+                            new_col -= 1;
                         }
-                        while col > 0 && !chars[col - 1].is_whitespace() {
-                            col -= 1;
+                        while new_col > 0 && !chars[new_col - 1].is_whitespace() {
+                            new_col -= 1;
                         }
                     }
-                    self.buffer.cursor_col = col;
+                    self.active_buffer_mut().cursor_col = new_col;
                 }
             }
             KeyCode::Char('0') => {
-                self.buffer.cursor_col = 0;
+                self.active_buffer_mut().cursor_col = 0;
             }
             KeyCode::Char('$') => {
-                if let Some(line) = self.buffer.current_line() {
+                if let Some(line) = self.active_buffer().current_line() {
                     let len = line.text.chars().count();
-                    self.buffer.cursor_col = len.saturating_sub(1);
+                    self.active_buffer_mut().cursor_col = len.saturating_sub(1);
                 }
             }
             KeyCode::Char('G') => {
-                if !self.buffer.lines.is_empty() {
-                    self.buffer.cursor_row = self.buffer.lines.len() - 1;
-                    self.buffer.clamp_cursor_normal();
+                let total = self.active_buffer().lines.len();
+                if total > 0 {
+                    self.active_buffer_mut().cursor_row = total - 1;
+                    self.active_buffer_mut().clamp_cursor_normal();
+                    self.ensure_child_preview();
                 }
             }
 
             // Scrolling: Ctrl-d / Ctrl-u
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let half = 10;
-                if !self.buffer.lines.is_empty() {
-                    self.buffer.cursor_row = (self.buffer.cursor_row + half).min(self.buffer.lines.len() - 1);
-                    self.buffer.clamp_cursor_normal();
+                let total = self.active_buffer().lines.len();
+                if total > 0 {
+                    self.active_buffer_mut().cursor_row =
+                        (self.active_buffer().cursor_row + 10).min(total - 1);
+                    self.active_buffer_mut().clamp_cursor_normal();
+                    self.ensure_child_preview();
                 }
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let half = 10;
-                self.buffer.cursor_row = self.buffer.cursor_row.saturating_sub(half);
-                self.buffer.clamp_cursor_normal();
+                self.active_buffer_mut().cursor_row =
+                    self.active_buffer().cursor_row.saturating_sub(10);
+                self.active_buffer_mut().clamp_cursor_normal();
+                self.ensure_child_preview();
             }
 
-            // Entering Insert Mode: 'i', 'a', 'I', 'A', 'o', 'O'
+            // Entering Insert Mode
             KeyCode::Char('i') => {
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('a') => {
-                if let Some(line) = self.buffer.current_line() {
+                if let Some(line) = self.active_buffer().current_line() {
                     let len = line.text.chars().count();
-                    self.buffer.cursor_col = (self.buffer.cursor_col + 1).min(len);
+                    self.active_buffer_mut().cursor_col =
+                        (self.active_buffer().cursor_col + 1).min(len);
                 }
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('I') => {
-                self.buffer.cursor_col = 0;
+                self.active_buffer_mut().cursor_col = 0;
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('A') => {
-                if let Some(line) = self.buffer.current_line() {
-                    self.buffer.cursor_col = line.text.chars().count();
+                if let Some(line) = self.active_buffer().current_line() {
+                    self.active_buffer_mut().cursor_col = line.text.chars().count();
                 }
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('o') => {
-                self.buffer.insert_line_below();
+                self.active_buffer_mut().insert_line_below();
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('O') => {
-                self.buffer.insert_line_above();
+                self.active_buffer_mut().insert_line_above();
                 self.mode = Mode::Insert;
             }
 
@@ -339,9 +484,8 @@ impl App {
                     if next.kind == KeyEventKind::Press {
                         match next.code {
                             KeyCode::Char('w') => {
-                                // Change word
-                                let cursor_col = self.buffer.cursor_col;
-                                if let Some(line) = self.buffer.current_line_mut() {
+                                let cursor_col = self.active_buffer().cursor_col;
+                                if let Some(line) = self.active_buffer_mut().current_line_mut() {
                                     let chars: Vec<char> = line.text.chars().collect();
                                     let mut end = cursor_col;
                                     while end < chars.len() && !chars[end].is_whitespace() {
@@ -354,11 +498,10 @@ impl App {
                                 self.mode = Mode::Insert;
                             }
                             KeyCode::Char('c') => {
-                                // Clear whole line
-                                if let Some(line) = self.buffer.current_line_mut() {
+                                if let Some(line) = self.active_buffer_mut().current_line_mut() {
                                     line.text.clear();
                                 }
-                                self.buffer.cursor_col = 0;
+                                self.active_buffer_mut().cursor_col = 0;
                                 self.mode = Mode::Insert;
                             }
                             _ => {}
@@ -367,73 +510,111 @@ impl App {
                 }
             }
             KeyCode::Char('C') => {
-                self.buffer.delete_to_end_of_line();
+                self.active_buffer_mut().delete_to_end_of_line();
                 self.mode = Mode::Insert;
             }
 
-            // Deletions: 'd' prefix
+            // Deletions: 'dd', 'D'
             KeyCode::Char('d') => {
                 if let Ok(Event::Key(next)) = event::read() {
                     if next.kind == KeyEventKind::Press && next.code == KeyCode::Char('d') {
-                        if let Some(deleted) = self.buffer.delete_line() {
-                            self.clipboard = vec![deleted.text];
+                        if let Some(deleted) = self.active_buffer_mut().delete_line() {
+                            self.clipboard = vec![ClipboardItem {
+                                line: deleted,
+                                is_cut: true,
+                            }];
+                            self.ensure_child_preview();
                         }
                     }
                 }
             }
             KeyCode::Char('D') => {
-                self.buffer.delete_to_end_of_line();
+                self.active_buffer_mut().delete_to_end_of_line();
             }
 
-            // Yank & Paste: 'y', 'p', 'P'
+            // Yank & Paste: 'yy', 'p', 'P'
             KeyCode::Char('y') => {
                 if let Ok(Event::Key(next)) = event::read() {
                     if next.kind == KeyEventKind::Press && next.code == KeyCode::Char('y') {
-                        if let Some(line) = self.buffer.current_line() {
-                            self.clipboard = vec![line.text.clone()];
+                        if let Some(line) = self.active_buffer().current_line() {
+                            self.clipboard = vec![ClipboardItem {
+                                line: line.clone(),
+                                is_cut: false,
+                            }];
                             self.set_status("Line yanked");
                         }
                     }
                 }
             }
             KeyCode::Char('p') => {
-                if !self.clipboard.is_empty() {
-                    for text in &self.clipboard {
-                        let insert_idx = self.buffer.cursor_row + 1;
-                        self.buffer.lines.insert(
-                            insert_idx,
-                            crate::buffer::BufferLine::new_with_text(text.clone()),
-                        );
-                        self.buffer.cursor_row = insert_idx;
+                let items = self.clipboard.clone();
+                if !items.is_empty() {
+                    for item in &items {
+                        let insert_idx = self.active_buffer().cursor_row + 1;
+                        let mut pasted_line = item.line.clone();
+                        if item.is_cut {
+                            let is_same_dir = pasted_line
+                                .source_path
+                                .as_ref()
+                                .and_then(|p| p.parent())
+                                .map(|p| p == self.active_buffer().current_dir)
+                                .unwrap_or(false);
+
+                            if !is_same_dir {
+                                pasted_line.entry_id = None;
+                            }
+                        } else {
+                            pasted_line.entry_id = None;
+                            pasted_line.source_path = None;
+                        }
+                        self.active_buffer_mut().lines.insert(insert_idx, pasted_line);
+                        self.active_buffer_mut().cursor_row = insert_idx;
                     }
-                    self.buffer.clamp_cursor_normal();
+                    self.active_buffer_mut().clamp_cursor_normal();
+                    self.ensure_child_preview();
                 }
             }
             KeyCode::Char('P') => {
-                if !self.clipboard.is_empty() {
-                    for text in &self.clipboard {
-                        let insert_idx = self.buffer.cursor_row;
-                        self.buffer.lines.insert(
-                            insert_idx,
-                            crate::buffer::BufferLine::new_with_text(text.clone()),
-                        );
+                let items = self.clipboard.clone();
+                if !items.is_empty() {
+                    for item in &items {
+                        let insert_idx = self.active_buffer().cursor_row;
+                        let mut pasted_line = item.line.clone();
+                        if item.is_cut {
+                            let is_same_dir = pasted_line
+                                .source_path
+                                .as_ref()
+                                .and_then(|p| p.parent())
+                                .map(|p| p == self.active_buffer().current_dir)
+                                .unwrap_or(false);
+
+                            if !is_same_dir {
+                                pasted_line.entry_id = None;
+                            }
+                        } else {
+                            pasted_line.entry_id = None;
+                            pasted_line.source_path = None;
+                        }
+                        self.active_buffer_mut().lines.insert(insert_idx, pasted_line);
                     }
-                    self.buffer.clamp_cursor_normal();
+                    self.active_buffer_mut().clamp_cursor_normal();
+                    self.ensure_child_preview();
                 }
             }
 
             // Visual Line Mode: 'V'
             KeyCode::Char('V') => {
                 self.mode = Mode::VisualLine {
-                    start_row: self.buffer.cursor_row,
+                    start_row: self.active_buffer().cursor_row,
                 };
             }
 
             // Undo / Redo: 'u', 'Ctrl-r'
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::NONE) => {
-                // Check filesystem undo stack
                 if self.undo_stack.undo()? {
-                    self.buffer.reload(self.config.show_hidden, self.config.natural_sort)?;
+                    for col in &mut self.columns {
+                        let _ = col.reload(self.config.show_hidden, self.config.natural_sort);
+                    }
                     self.set_status("Undid last filesystem change");
                 } else {
                     self.set_status("Already at oldest change");
@@ -441,20 +622,21 @@ impl App {
             }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.undo_stack.redo()? {
-                    self.buffer.reload(self.config.show_hidden, self.config.natural_sort)?;
+                    for col in &mut self.columns {
+                        let _ = col.reload(self.config.show_hidden, self.config.natural_sort);
+                    }
                     self.set_status("Redid filesystem change");
                 } else {
                     self.set_status("Already at newest change");
                 }
             }
             KeyCode::Char('r') => {
-                // Replace single character
                 if let Ok(Event::Key(next)) = event::read() {
                     if next.kind == KeyEventKind::Press {
                         if let KeyCode::Char(ch) = next.code {
-                            self.buffer.delete_char_under();
-                            self.buffer.insert_char(ch);
-                            self.buffer.clamp_cursor_normal();
+                            self.active_buffer_mut().delete_char_under();
+                            self.active_buffer_mut().insert_char(ch);
+                            self.active_buffer_mut().clamp_cursor_normal();
                         }
                     }
                 }
@@ -473,6 +655,20 @@ impl App {
                     input: String::new(),
                 };
             }
+            KeyCode::Char('n') => {
+                if let Some(query) = self.search_query.clone() {
+                    self.jump_to_next_match(&query);
+                } else {
+                    self.set_status("No previous search query");
+                }
+            }
+            KeyCode::Char('N') => {
+                if let Some(query) = self.search_query.clone() {
+                    self.jump_to_prev_match(&query);
+                } else {
+                    self.set_status("No previous search query");
+                }
+            }
 
             _ => {}
         }
@@ -484,26 +680,27 @@ impl App {
     fn handle_insert_mode(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Esc => {
-                self.buffer.clamp_cursor_normal();
+                self.active_buffer_mut().clamp_cursor_normal();
                 self.mode = Mode::Normal;
+                self.ensure_child_preview();
             }
             KeyCode::Backspace => {
-                self.buffer.delete_char_before();
+                self.active_buffer_mut().delete_char_before();
             }
             KeyCode::Delete => {
-                self.buffer.delete_char_under();
+                self.active_buffer_mut().delete_char_under();
             }
             KeyCode::Enter => {
-                self.buffer.insert_line_below();
+                self.active_buffer_mut().insert_line_below();
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.buffer.delete_word_before();
+                self.active_buffer_mut().delete_word_before();
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.buffer.clear_to_start();
+                self.active_buffer_mut().clear_to_start();
             }
             KeyCode::Char(c) => {
-                self.buffer.insert_char(c);
+                self.active_buffer_mut().insert_char(c);
             }
             _ => {}
         }
@@ -517,42 +714,53 @@ impl App {
                 self.mode = Mode::Normal;
             }
             KeyCode::Char('j') => {
-                if !self.buffer.lines.is_empty() {
-                    self.buffer.cursor_row = (self.buffer.cursor_row + 1).min(self.buffer.lines.len() - 1);
+                let total = self.active_buffer().lines.len();
+                if total > 0 {
+                    self.active_buffer_mut().cursor_row =
+                        (self.active_buffer().cursor_row + 1).min(total - 1);
                 }
             }
             KeyCode::Char('k') => {
-                self.buffer.cursor_row = self.buffer.cursor_row.saturating_sub(1);
+                self.active_buffer_mut().cursor_row =
+                    self.active_buffer().cursor_row.saturating_sub(1);
             }
             KeyCode::Char('d') | KeyCode::Char('x') => {
-                let (low, high) = if start_row <= self.buffer.cursor_row {
-                    (start_row, self.buffer.cursor_row)
+                let (low, high) = if start_row <= self.active_buffer().cursor_row {
+                    (start_row, self.active_buffer().cursor_row)
                 } else {
-                    (self.buffer.cursor_row, start_row)
+                    (self.active_buffer().cursor_row, start_row)
                 };
 
-                let mut deleted_texts = Vec::new();
+                let mut deleted_items = Vec::new();
                 for _ in low..=high {
-                    if low < self.buffer.lines.len() {
-                        let removed = self.buffer.lines.remove(low);
-                        deleted_texts.push(removed.text);
+                    if low < self.active_buffer().lines.len() {
+                        let removed = self.active_buffer_mut().lines.remove(low);
+                        deleted_items.push(ClipboardItem {
+                            line: removed,
+                            is_cut: true,
+                        });
                     }
                 }
-                self.clipboard = deleted_texts;
-                self.buffer.cursor_row = low.min(self.buffer.lines.len().saturating_sub(1));
-                self.buffer.clamp_cursor_normal();
+                self.clipboard = deleted_items;
+                self.active_buffer_mut().cursor_row =
+                    low.min(self.active_buffer().lines.len().saturating_sub(1));
+                self.active_buffer_mut().clamp_cursor_normal();
                 self.mode = Mode::Normal;
+                self.ensure_child_preview();
             }
             KeyCode::Char('y') => {
-                let (low, high) = if start_row <= self.buffer.cursor_row {
-                    (start_row, self.buffer.cursor_row)
+                let (low, high) = if start_row <= self.active_buffer().cursor_row {
+                    (start_row, self.active_buffer().cursor_row)
                 } else {
-                    (self.buffer.cursor_row, start_row)
+                    (self.active_buffer().cursor_row, start_row)
                 };
 
-                self.clipboard = self.buffer.lines[low..=high]
+                self.clipboard = self.active_buffer().lines[low..=high]
                     .iter()
-                    .map(|l| l.text.clone())
+                    .map(|l| ClipboardItem {
+                        line: l.clone(),
+                        is_cut: false,
+                    })
                     .collect();
                 self.set_status(format!("{} lines yanked", self.clipboard.len()));
                 self.mode = Mode::Normal;
@@ -588,37 +796,63 @@ impl App {
         Ok(())
     }
 
+    /// Collect diffs from ALL modified open directories and compute combined plan.
+    fn collect_all_diffs(&self) -> Result<FsPlan> {
+        let mut combined_actions = Vec::new();
+
+        for col in &self.columns {
+            if col.is_dirty() {
+                let plan = compute_diff(&col.current_dir, &col.baseline, &col.lines)?;
+                combined_actions.extend(plan.actions);
+            }
+        }
+
+        // Reconcile: If a file or directory is being Moved or Renamed, cancel any Delete
+        // action for that same source path so it moves rather than being deleted!
+        let moved_from: HashSet<PathBuf> = combined_actions
+            .iter()
+            .filter_map(|a| match a {
+                FsAction::Move { from, .. } | FsAction::Rename { from, .. } => Some(from.clone()),
+                _ => None,
+            })
+            .collect();
+
+        combined_actions.retain(|a| match a {
+            FsAction::Delete { path, .. } => !moved_from.contains(path),
+            _ => true,
+        });
+
+        Ok(FsPlan {
+            actions: combined_actions,
+        })
+    }
+
     /// Parse and execute colon commands (:w, :q, etc.).
     fn execute_colon_command(&mut self, cmd: &str) -> Result<()> {
         let trimmed = cmd.trim();
         match trimmed {
-            // :w to view diff and save changes
+            // :w to save changes (only confirms if something is being deleted)
             "w" | "write" => {
-                let plan = compute_diff(
-                    &self.buffer.current_dir,
-                    &self.buffer.baseline,
-                    &self.buffer.lines,
-                )?;
+                let plan = self.collect_all_diffs()?;
 
                 if plan.is_empty() {
-                    self.set_status("No changes to save");
+                    self.set_status("No changes to save across any directory");
                     self.mode = Mode::Normal;
-                } else if self.config.confirm_diff {
+                } else if plan.has_deletions() && self.config.confirm_diff {
+                    // Confirmation dialog only shown when deletions are present
                     self.pending_plan = Some(plan);
+                    self.quit_after_confirm = false;
                     self.mode = Mode::ConfirmModal { scroll: 0 };
                 } else {
+                    // Directly save creates, renames, and moves
                     self.apply_plan(plan)?;
                     self.mode = Mode::Normal;
                 }
             }
 
-            // :w! to force save without confirmation dialog
+            // :w! to force save all directories without confirmation dialog
             "w!" => {
-                let plan = compute_diff(
-                    &self.buffer.current_dir,
-                    &self.buffer.baseline,
-                    &self.buffer.lines,
-                )?;
+                let plan = self.collect_all_diffs()?;
                 if plan.is_empty() {
                     self.set_status("No changes to save");
                 } else {
@@ -629,8 +863,12 @@ impl App {
 
             // :q to quit
             "q" | "quit" => {
-                if self.buffer.is_dirty() {
-                    self.set_status("Unsaved buffer edits! Use :w to save or :q! to force quit.");
+                let dirty_count = self.columns.iter().filter(|c| c.is_dirty()).count();
+                if dirty_count > 0 {
+                    self.set_status(format!(
+                        "{} directories have unsaved edits! Use :w to save or :q! to force quit.",
+                        dirty_count
+                    ));
                     self.mode = Mode::Normal;
                 } else {
                     self.should_quit = true;
@@ -644,22 +882,28 @@ impl App {
 
             // :wq or :x
             "wq" | "x" => {
-                let plan = compute_diff(
-                    &self.buffer.current_dir,
-                    &self.buffer.baseline,
-                    &self.buffer.lines,
-                )?;
-                if !plan.is_empty() {
+                let plan = self.collect_all_diffs()?;
+                if plan.is_empty() {
+                    self.should_quit = true;
+                } else if plan.has_deletions() && self.config.confirm_diff {
+                    self.pending_plan = Some(plan);
+                    self.quit_after_confirm = true;
+                    self.mode = Mode::ConfirmModal { scroll: 0 };
+                } else {
                     self.apply_plan(plan)?;
+                    self.should_quit = true;
                 }
-                self.should_quit = true;
             }
 
-            // :e to reload directory
+            // :e to reload active directory
             "e" | "edit" => {
-                self.buffer.reload(self.config.show_hidden, self.config.natural_sort)?;
-                self.set_status("Directory reloaded from disk");
+                let show_hidden = self.config.show_hidden;
+                let natural_sort = self.config.natural_sort;
+                self.active_buffer_mut()
+                    .reload(show_hidden, natural_sort)?;
+                self.set_status("Active directory reloaded from disk");
                 self.mode = Mode::Normal;
+                self.ensure_child_preview();
             }
 
             // :help or :h
@@ -667,7 +911,18 @@ impl App {
                 self.mode = Mode::HelpModal { scroll: 0 };
             }
 
-            // Unknown
+            // :set cursorline / :set nocursorline
+            "set cursorline" | "set cul" => {
+                self.config.cursorline = true;
+                self.set_status("cursorline enabled");
+                self.mode = Mode::Normal;
+            }
+            "set nocursorline" | "set nocul" => {
+                self.config.cursorline = false;
+                self.set_status("cursorline disabled");
+                self.mode = Mode::Normal;
+            }
+
             _ => {
                 self.set_status(format!("Not an editor command: {}", trimmed));
                 self.mode = Mode::Normal;
@@ -703,21 +958,52 @@ impl App {
         Ok(())
     }
 
-    /// Jump to next filename matching search query.
+    /// Jump to next filename matching search query in active buffer.
     fn jump_to_next_match(&mut self, query: &str) {
         let query_lower = query.to_lowercase();
-        let total = self.buffer.lines.len();
+        let total = self.active_buffer().lines.len();
         if total == 0 {
             return;
         }
 
-        let start = (self.buffer.cursor_row + 1) % total;
+        let start = (self.active_buffer().cursor_row + 1) % total;
         for i in 0..total {
             let idx = (start + i) % total;
-            if self.buffer.lines[idx].text.to_lowercase().contains(&query_lower) {
-                self.buffer.cursor_row = idx;
-                self.buffer.clamp_cursor_normal();
-                self.set_status(format!("Match: {}", self.buffer.lines[idx].text));
+            if self.active_buffer().lines[idx]
+                .text
+                .to_lowercase()
+                .contains(&query_lower)
+            {
+                self.active_buffer_mut().cursor_row = idx;
+                self.active_buffer_mut().clamp_cursor_normal();
+                self.set_status(format!("Match: {}", self.active_buffer().lines[idx].text));
+                self.ensure_child_preview();
+                return;
+            }
+        }
+        self.set_status(format!("Pattern not found: {}", query));
+    }
+
+    /// Jump to previous filename matching search query in active buffer.
+    fn jump_to_prev_match(&mut self, query: &str) {
+        let query_lower = query.to_lowercase();
+        let total = self.active_buffer().lines.len();
+        if total == 0 {
+            return;
+        }
+
+        let current = self.active_buffer().cursor_row;
+        for i in 1..=total {
+            let idx = (current + total - (i % total)) % total;
+            if self.active_buffer().lines[idx]
+                .text
+                .to_lowercase()
+                .contains(&query_lower)
+            {
+                self.active_buffer_mut().cursor_row = idx;
+                self.active_buffer_mut().clamp_cursor_normal();
+                self.set_status(format!("Match: {}", self.active_buffer().lines[idx].text));
+                self.ensure_child_preview();
                 return;
             }
         }
@@ -731,10 +1017,15 @@ impl App {
                 if let Some(plan) = self.pending_plan.take() {
                     self.apply_plan(plan)?;
                 }
-                self.mode = Mode::Normal;
+                if self.quit_after_confirm {
+                    self.should_quit = true;
+                } else {
+                    self.mode = Mode::Normal;
+                }
             }
             KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
                 self.pending_plan = None;
+                self.quit_after_confirm = false;
                 self.set_status("Changes aborted");
                 self.mode = Mode::Normal;
             }
@@ -766,69 +1057,61 @@ impl App {
         Ok(())
     }
 
-    /// Dirty Navigation Guard prompt.
-    fn handle_dirty_prompt(&mut self, key: KeyEvent, target: PathBuf, _is_parent: bool) -> Result<()> {
-        match key.code {
-            // 'w' to review and save before navigating
-            KeyCode::Char('w') => {
-                let plan = compute_diff(
-                    &self.buffer.current_dir,
-                    &self.buffer.baseline,
-                    &self.buffer.lines,
-                )?;
-                if !plan.is_empty() {
-                    self.apply_plan(plan)?;
-                }
-                self.navigate_to(target)?;
-                self.mode = Mode::Normal;
-            }
-            // 'd' to discard and navigate
-            KeyCode::Char('d') => {
-                self.navigate_to(target)?;
-                self.mode = Mode::Normal;
-            }
-            // Esc to cancel navigation
-            KeyCode::Esc => {
-                self.mode = Mode::Normal;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
     // --- Helpers ---
 
-    /// Commit the given plan to disk and reload the buffer.
+    /// Commit the given plan to disk and reload all dirty columns.
     fn apply_plan(&mut self, plan: FsPlan) -> Result<()> {
         let count = plan.len();
         let undo_batch = execute_plan(&plan, self.config.trash_deletes)?;
         self.undo_stack.push(undo_batch);
-        self.buffer.reload(self.config.show_hidden, self.config.natural_sort)?;
-        self.set_status(format!("Successfully applied {} changes", count));
-        Ok(())
-    }
 
-    /// Switch active directory buffer.
-    fn navigate_to(&mut self, path: PathBuf) -> Result<()> {
-        self.buffer = DirectoryBuffer::load(&path, self.config.show_hidden, self.config.natural_sort)?;
+        // Reload all dirty buffers with fresh state from disk
+        for col in &mut self.columns {
+            let _ = col.reload(self.config.show_hidden, self.config.natural_sort);
+        }
+
+        self.set_status(format!(
+            "Successfully applied {} changes across directories",
+            count
+        ));
+        self.ensure_child_preview();
         Ok(())
     }
 
     /// Open a file in the user's terminal $EDITOR.
     fn open_in_editor(&mut self, path: &Path, terminal: &mut Terminal) -> Result<()> {
-        // Temporarily leave alternate screen
-        terminal.restore()?;
+        terminal.suspend()?;
 
-        let status = Command::new(&self.config.default_editor)
-            .arg(path)
-            .status()
-            .with_context(|| format!("Failed to launch editor: {}", self.config.default_editor));
+        let parts: Vec<&str> = self.config.default_editor.split_whitespace().collect();
+        let (bin, args) = parts.split_first().unwrap_or((&"nano", &[]));
 
-        // Re-initialize terminal
-        *terminal = Terminal::init()?;
+        let mut cmd = Command::new(bin);
+        cmd.args(args);
+        cmd.arg(path);
+        cmd.stdin(std::process::Stdio::inherit());
+        cmd.stdout(std::process::Stdio::inherit());
+        cmd.stderr(std::process::Stdio::inherit());
 
-        if let Err(e) = status {
-            self.set_status(format!("Editor error: {}", e));
+        let status = cmd.status();
+
+        terminal.resume()?;
+
+        match status {
+            Ok(s) if !s.success() => {
+                self.set_status(format!("Editor exited with status: {}", s));
+            }
+            Err(e) => {
+                self.set_status(format!("Failed to run editor '{}': {}", bin, e));
+            }
+            _ => {
+                let show_hidden = self.config.show_hidden;
+                let natural_sort = self.config.natural_sort;
+                if !self.active_buffer().is_dirty() {
+                    let _ = self
+                        .active_buffer_mut()
+                        .reload(show_hidden, natural_sort);
+                }
+            }
         }
 
         Ok(())
@@ -836,17 +1119,252 @@ impl App {
 
     /// Open item with system opener (e.g. xdg-open for 'gx').
     fn open_with_system_opener(&mut self) -> Result<()> {
-        if let Some(line) = self.buffer.current_line() {
-            let target = self.buffer.current_dir.join(line.clean_name());
-            let res = Command::new(&self.config.opener)
+        let active = &self.columns[self.active_col];
+        if let Some(line) = active.current_line() {
+            let target = active.current_dir.join(line.clean_name());
+            let parts: Vec<&str> = self.config.opener.split_whitespace().collect();
+            let (bin, args) = parts.split_first().unwrap_or((&"xdg-open", &[]));
+
+            let res = Command::new(bin)
+                .args(args)
                 .arg(&target)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn();
 
             match res {
-                Ok(_) => self.set_status(format!("Opened with {}", self.config.opener)),
+                Ok(_) => self.set_status(format!("Opened with {}", bin)),
                 Err(e) => self.set_status(format!("Opener error: {}", e)),
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_keep_columns_open_when_cursor_on_file() {
+        let temp_dir = std::env::temp_dir().join(format!("euler_col_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(temp_dir.join("subfolder")).unwrap();
+        fs::create_dir_all(temp_dir.join("subfolder2")).unwrap();
+        fs::write(temp_dir.join("a_file.txt"), "hello").unwrap();
+        fs::write(temp_dir.join("subfolder/inner.txt"), "inner").unwrap();
+        fs::write(temp_dir.join("subfolder2/other.txt"), "other").unwrap();
+
+        let config = Config::default();
+        let mut app = App::new(&temp_dir, config).unwrap();
+
+        // Position cursor on 'subfolder'
+        let subfolder_pos = app.columns[0]
+            .lines
+            .iter()
+            .position(|l| l.clean_name() == "subfolder")
+            .unwrap();
+        app.columns[0].cursor_row = subfolder_pos;
+        app.ensure_child_preview();
+
+        // subfolder column should now be open (2 columns total)
+        assert_eq!(app.columns.len(), 2);
+        assert_eq!(
+            app.columns[1].current_dir,
+            temp_dir.join("subfolder")
+        );
+
+        // Move cursor onto a regular file ('a_file.txt')
+        let file_pos = app.columns[0]
+            .lines
+            .iter()
+            .position(|l| l.clean_name() == "a_file.txt")
+            .unwrap();
+        app.columns[0].cursor_row = file_pos;
+        app.ensure_child_preview();
+
+        // REQUIREMENT: Open column MUST NOT close when cursor moves to a file!
+        assert_eq!(
+            app.columns.len(),
+            2,
+            "Open column must remain viewable when cursor moves to a file"
+        );
+        assert_eq!(
+            app.columns[1].current_dir,
+            temp_dir.join("subfolder")
+        );
+
+        // Move cursor to another folder ('subfolder2')
+        let subfolder2_pos = app.columns[0]
+            .lines
+            .iter()
+            .position(|l| l.clean_name() == "subfolder2")
+            .unwrap();
+        app.columns[0].cursor_row = subfolder2_pos;
+        app.ensure_child_preview();
+
+        // REQUIREMENT: When cursor moves to a new folder, update the view!
+        assert_eq!(app.columns.len(), 2);
+        assert_eq!(
+            app.columns[1].current_dir,
+            temp_dir.join("subfolder2")
+        );
+
+        // Clean up
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_move_file_operation_via_dd_and_paste() {
+        let temp_dir = std::env::temp_dir().join(format!("euler_move_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let dir_a = temp_dir.join("folder_a");
+        let dir_b = temp_dir.join("folder_b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let file_path = dir_a.join("document.txt");
+        fs::write(&file_path, "important data not to be lost").unwrap();
+
+        let config = Config::default();
+        let buf_a = DirectoryBuffer::load(&dir_a, config.show_hidden, config.natural_sort).unwrap();
+        let buf_b = DirectoryBuffer::load(&dir_b, config.show_hidden, config.natural_sort).unwrap();
+
+        let mut app = App {
+            columns: vec![buf_a, buf_b],
+            active_col: 0,
+            config,
+            mode: Mode::Normal,
+            pending_plan: None,
+            undo_stack: UndoStack::new(),
+            clipboard: Vec::new(),
+            search_query: None,
+            status_msg: None,
+            should_quit: false,
+            quit_after_confirm: false,
+        };
+
+        // 1. In folder_a: delete with 'dd' (cut)
+        let deleted = app.active_buffer_mut().delete_line().expect("Should delete document.txt");
+        assert_eq!(deleted.clean_name(), "document.txt");
+        assert_eq!(deleted.source_path, Some(file_path.clone()));
+
+        app.clipboard = vec![ClipboardItem {
+            line: deleted,
+            is_cut: true,
+        }];
+
+        // 2. Navigate to folder_b (col 1) and paste with 'p'
+        app.active_col = 1;
+        let items = app.clipboard.clone();
+        for item in &items {
+            let mut pasted_line = item.line.clone();
+            // Moved to a different directory: clear local entry_id
+            pasted_line.entry_id = None;
+            app.active_buffer_mut().lines.push(pasted_line);
+        }
+
+        // 3. Compute diff across all columns
+        let plan = app.collect_all_diffs().unwrap();
+
+        // CRITICAL: Must be a MOVE action, NOT Delete + Create!
+        assert_eq!(plan.actions.len(), 1, "Plan should contain exactly 1 action (Move)");
+        assert_eq!(
+            plan.actions[0],
+            FsAction::Move {
+                from: dir_a.join("document.txt"),
+                to: dir_b.join("document.txt"),
+            }
+        );
+        assert!(!plan.has_deletions(), "Move plan must NOT have deletions");
+
+        // 4. Apply the plan to disk
+        app.apply_plan(plan).unwrap();
+
+        // 5. Verify filesystem: file moved and content preserved!
+        assert!(!dir_a.join("document.txt").exists(), "Source file should be moved away");
+        assert!(dir_b.join("document.txt").exists(), "Destination file must exist");
+        let content = fs::read_to_string(dir_b.join("document.txt")).unwrap();
+        assert_eq!(content, "important data not to be lost");
+
+        // 6. Test Undo: 'u' rolls back the move
+        assert!(app.undo_stack.undo().unwrap());
+        assert!(dir_a.join("document.txt").exists(), "File should be restored to folder_a");
+        assert!(!dir_b.join("document.txt").exists(), "File should no longer be in folder_b");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_same_directory_dd_and_paste_is_not_delete() {
+        let temp_dir = std::env::temp_dir().join(format!("euler_same_dir_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("file.txt");
+        fs::write(&file_path, "same directory content").unwrap();
+
+        let config = Config::default();
+        let mut app = App::new(&temp_dir, config).unwrap();
+
+        // 1. Delete line with 'dd'
+        let deleted = app.active_buffer_mut().delete_line().unwrap();
+        app.clipboard = vec![ClipboardItem {
+            line: deleted,
+            is_cut: true,
+        }];
+
+        // 2. Paste back in the SAME directory with 'p'
+        let item = &app.clipboard[0];
+        let pasted_line = item.line.clone();
+        app.active_buffer_mut().lines.push(pasted_line);
+
+        // 3. Compute diff: since source_path == target_path and entry_id is retained,
+        // no filesystem action should be generated!
+        let plan = app.collect_all_diffs().unwrap();
+        assert!(
+            plan.is_empty(),
+            "Cutting and pasting in the same directory without rename should produce 0 changes"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_search_navigation_next_and_prev() {
+        let temp_dir = std::env::temp_dir().join(format!("euler_search_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        fs::write(temp_dir.join("alpha.txt"), "").unwrap();
+        fs::write(temp_dir.join("beta.txt"), "").unwrap();
+        fs::write(temp_dir.join("gamma.txt"), "").unwrap();
+        fs::write(temp_dir.join("alphabet.txt"), "").unwrap();
+
+        let config = Config::default();
+        let mut app = App::new(&temp_dir, config).unwrap();
+        // At start, cursor is at row 0 ("alpha.txt")
+        assert_eq!(app.active_buffer().cursor_row, 0);
+
+        // Next match 'n': advances to next match at row 1 ("alphabet.txt")
+        app.jump_to_next_match("alpha");
+        assert_eq!(app.active_buffer().cursor_row, 1);
+
+        // Next match 'n' again: wraps around to row 0 ("alpha.txt")
+        app.jump_to_next_match("alpha");
+        assert_eq!(app.active_buffer().cursor_row, 0);
+
+        // Previous match 'N': moves backward to row 1 ("alphabet.txt")
+        app.jump_to_prev_match("alpha");
+        assert_eq!(app.active_buffer().cursor_row, 1);
+
+        // Previous match 'N' again: moves backward to row 0 ("alpha.txt")
+        app.jump_to_prev_match("alpha");
+        assert_eq!(app.active_buffer().cursor_row, 0);
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

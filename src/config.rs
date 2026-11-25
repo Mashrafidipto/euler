@@ -8,7 +8,7 @@ pub struct Config {
     /// Whether hidden files (starting with '.') are visible by default.
     pub show_hidden: bool,
 
-    /// Whether to show the interactive diff confirmation dialog on `:w`.
+    /// Whether to show the diff confirmation dialog on `:w` when deletions are present.
     pub confirm_diff: bool,
 
     /// Whether deleted files are moved to system trash (true) or permanently deleted (false).
@@ -25,6 +25,9 @@ pub struct Config {
 
     /// Whether to explicitly disable all arrow keys across the entire application.
     pub disable_arrow_keys: bool,
+
+    /// Whether to highlight the line containing the cursor (Vim `cursorline`).
+    pub cursorline: bool,
 }
 
 impl Default for Config {
@@ -41,6 +44,7 @@ impl Default for Config {
             default_editor: editor,
             opener: "xdg-open".to_string(),
             disable_arrow_keys: true,
+            cursorline: true, // enabled by default
         }
     }
 }

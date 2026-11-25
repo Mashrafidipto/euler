@@ -41,14 +41,10 @@ impl DirectoryBuffer {
         let mut baseline = BTreeMap::new();
         let mut next_id = 1;
 
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(&abs_path)
+        let mut entries: Vec<_> = fs::read_dir(&abs_path)
             .with_context(|| format!("Failed to read directory: {:?}", abs_path))?
-        {
-            if let Ok(entry) = entry {
-                entries.push(entry);
-            }
-        }
+            .flatten()
+            .collect();
 
         // Sort entries
         if natural_sort {
@@ -121,7 +117,7 @@ impl DirectoryBuffer {
             next_id += 1;
 
             baseline.insert(entry_id, (file_name.clone(), meta.clone()));
-            lines.push(BufferLine::from_disk(entry_id, file_name, meta));
+            lines.push(BufferLine::from_disk(entry_id, file_name, path, meta));
         }
 
         Ok(Self {
@@ -152,10 +148,17 @@ impl DirectoryBuffer {
             return true;
         }
 
-        // Check if any line was added or modified
+        // Check if any line was added, moved from elsewhere, or modified
         for line in &self.lines {
+            if let Some(ref src) = line.source_path {
+                let expected = self.current_dir.join(line.clean_name());
+                if src != &expected {
+                    return true; // Moved from a different path
+                }
+            }
+
             match line.entry_id {
-                None => return true, // Brand new line
+                None => return true, // Brand new line or pasted without local entry_id
                 Some(id) => {
                     if let Some((original_name, _)) = self.baseline.get(&id) {
                         if &line.text != original_name {

@@ -10,8 +10,8 @@ Normal Mode is the primary navigation and command mode.
 
 | Key / Keyword | Category | Planned Action | Notes / Oil.nvim Equivalent |
 | :--- | :--- | :--- | :--- |
-| **`h`** | Directory Navigation | **Move to previous / parent directory (`..`)** | Prompts if buffer has unsaved edits |
-| **`l`** | Directory Navigation | **Enter directory / Open file** in `$EDITOR` | Opens directory buffer or file |
+| **`h`** | Directory Navigation | **Move to parent / previous directory column (left)** | Freely navigates left; all in-flight edits preserved in memory |
+| **`l`** | Directory Navigation | **Enter directory column (right) / Open file** in `$EDITOR` | Opens/focuses adjacent column or opens file |
 | **`j`** | Navigation | Move cursor down one line | Standard Vim motion |
 | **`k`** | Navigation | Move cursor up one line | Standard Vim motion |
 | **`w`** | Navigation | Jump forward to the start of the next word | In filename |
@@ -110,8 +110,8 @@ Typing `:` in Normal mode opens the bottom command bar.
 
 | Command / Keyword | Arguments | Planned Action |
 | :--- | :--- | :--- |
-| **`:w`** / **`:write`** | None | **Compute diff of changes, open Diff Confirmation Modal, and commit on confirm** |
-| **`:w!`** | None | Force save: commits changes directly without confirmation modal |
+| **`:w`** / **`:write`** | None | **Saves changes immediately; prompts for confirmation only if items are being deleted** |
+| **`:w!`** | None | Force save: commits changes directly without confirmation modal regardless of deletions |
 | **`:q`** / **`:quit`** | None | Quit Euler. If buffer is dirty (unsaved edits), blocks and warns |
 | **`:q!`** | None | Force quit Euler immediately, discarding all unsaved buffer changes |
 | **`:wq`** / **`:x`** | None | Review & save changes via diff modal; exit Euler once applied |
@@ -119,6 +119,8 @@ Typing `:` in Normal mode opens the bottom command bar.
 | **`:cd`** | `[path]` | Change working directory to `[path]` (default: `$HOME`) |
 | **`:trash`** | None | Open system trash directory in a buffer |
 | **`:help`** / **`:h`** | None | Display help manual with keybinding overview |
+| **`:set cursorline`** / **`:set cul`** | None | Enable full cursor line highlighting |
+| **`:set nocursorline`** / **`:set nocul`** | None | Disable full cursor line highlighting |
 
 ---
 
@@ -129,7 +131,7 @@ These configuration keywords allow personalizing Euler's behavior.
 | Config Keyword | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | **`show_hidden`** | `boolean` | **`true`** | **Hidden files (`.dotfiles`) are visible by default.** Toggle with `g.` |
-| **`confirm_diff`** | `boolean` | `true` | If `true`, `:w` always displays the interactive diff review modal before modifying disk |
+| **`confirm_diff`** | `boolean` | `true` | If `true`, `:w` displays the confirmation modal whenever files/directories are being deleted |
 | **`trash_deletes`** | `boolean` | `true` | If `true`, deleted files are moved to system trash. If `false`, permanently unlinks |
 | **`natural_sort`** | `boolean` | `true` | If `true`, sorts filenames using natural version order (e.g. `2.txt` before `10.txt`) |
 | **`auto_save_on_nav`**| `boolean` | `false` | If `true`, automatically prompts to save when navigating into/out of a directory |
@@ -138,4 +140,5 @@ These configuration keywords allow personalizing Euler's behavior.
 | **`columns`** | `list` | `["icon", "permissions", "size", "mtime"]` | Columns displayed in the directory buffer alongside filenames |
 | **`line_numbers`** | `string` | `"relative"` | Options: `"relative"`, `"absolute"`, `"none"` |
 | **`theme`** | `string` | `"default"` | Color theme for file types, diff modal, and status bar |
+| **`cursorline`** | `boolean` | **`true`** | **Highlight the entire line containing the cursor (Vim `cursorline`). Enabled by default.** |
 | **`disable_arrow_keys`**| `boolean`| **`true`** | **Explicitly disable all arrow keys across the entire app** |

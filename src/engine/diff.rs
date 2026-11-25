@@ -54,6 +54,11 @@ impl FsPlan {
     pub fn len(&self) -> usize {
         self.actions.len()
     }
+
+    /// Whether this plan contains any file or directory deletion actions.
+    pub fn has_deletions(&self) -> bool {
+        self.actions.iter().any(|a| matches!(a, FsAction::Delete { .. }))
+    }
 }
 
 /// Compare the baseline snapshot against current buffer lines and generate a safe, ordered `FsPlan`.
@@ -65,13 +70,15 @@ pub fn compute_diff(
     let mut actions = Vec::new();
 
     // 1. Detect Deletions: any EntryId in baseline missing from live lines
+    // AND whose original path is not present in active source_paths of this buffer
     let active_ids: HashSet<EntryId> = lines.iter().filter_map(|l| l.entry_id).collect();
+    let active_sources: HashSet<PathBuf> = lines.iter().filter_map(|l| l.source_path.clone()).collect();
 
     for (id, (name, meta)) in baseline {
-        if !active_ids.contains(id) {
-            let path = current_dir.join(name);
+        let orig_path = current_dir.join(name);
+        if !active_ids.contains(id) && !active_sources.contains(&orig_path) {
             actions.push(FsAction::Delete {
-                path,
+                path: orig_path,
                 is_dir: meta.file_type == crate::buffer::FileType::Directory,
             });
         }
@@ -88,30 +95,43 @@ pub fn compute_diff(
             continue; // Ignore blank lines
         }
 
-        match line.entry_id {
-            None => {
-                // New line added by user -> Create
-                let target_path = current_dir.join(text);
-                if line.is_dir() {
-                    creates.push(FsAction::CreateDir { path: target_path });
+        let target_path = current_dir.join(text);
+
+        if let Some(ref from) = line.source_path {
+            // Line originated from an existing file or directory on disk
+            if from != &target_path {
+                if from.parent() == target_path.parent() {
+                    renames.push(FsAction::Rename {
+                        from: from.clone(),
+                        to: target_path,
+                    });
                 } else {
-                    creates.push(FsAction::CreateFile { path: target_path });
+                    moves.push(FsAction::Move {
+                        from: from.clone(),
+                        to: target_path,
+                    });
                 }
             }
-            Some(id) => {
-                if let Some((original_name, _)) = baseline.get(&id) {
-                    if text != original_name {
-                        let from = current_dir.join(original_name);
-                        let to = current_dir.join(text);
+        } else if let Some(id) = line.entry_id {
+            if let Some((original_name, _)) = baseline.get(&id) {
+                if text != original_name {
+                    let from = current_dir.join(original_name);
+                    let to = current_dir.join(text);
 
-                        // If text contains a directory separator, it's a move across directories
-                        if text.contains('/') {
-                            moves.push(FsAction::Move { from, to });
-                        } else {
-                            renames.push(FsAction::Rename { from, to });
-                        }
+                    // If text contains a directory separator, it's a move across directories
+                    if text.contains('/') {
+                        moves.push(FsAction::Move { from, to });
+                    } else {
+                        renames.push(FsAction::Rename { from, to });
                     }
                 }
+            }
+        } else {
+            // New line added by user without source -> Create
+            if line.is_dir() {
+                creates.push(FsAction::CreateDir { path: target_path });
+            } else {
+                creates.push(FsAction::CreateFile { path: target_path });
             }
         }
     }
@@ -123,13 +143,13 @@ pub fn compute_diff(
             FsAction::Delete { path, .. } => Some(path.clone()),
             _ => None,
         })
-        .chain(renames.iter().map(|a| match a {
-            FsAction::Rename { from, .. } => from.clone(),
-            _ => unreachable!(),
+        .chain(renames.iter().filter_map(|a| match a {
+            FsAction::Rename { from, .. } => Some(from.clone()),
+            _ => None,
         }))
-        .chain(moves.iter().map(|a| match a {
-            FsAction::Move { from, .. } => from.clone(),
-            _ => unreachable!(),
+        .chain(moves.iter().filter_map(|a| match a {
+            FsAction::Move { from, .. } => Some(from.clone()),
+            _ => None,
         }))
         .collect();
 

@@ -36,8 +36,23 @@ pub fn execute_plan(plan: &FsPlan, trash_deletes: bool) -> Result<Vec<UndoAction
                     fs::create_dir_all(parent)
                         .with_context(|| format!("Failed to create parent dirs for: {:?}", to))?;
                 }
-                fs::rename(from, to)
-                    .with_context(|| format!("Failed to rename {:?} to {:?}", from, to))?;
+                if let Err(e) = fs::rename(from, to) {
+                    // Fallback for cross-device moves (EXDEV = 18 on Unix)
+                    if e.raw_os_error() == Some(18) {
+                        if from.is_dir() {
+                            copy_dir_recursive(from, to)?;
+                            fs::remove_dir_all(from)
+                                .with_context(|| format!("Failed to remove source dir after cross-device move: {:?}", from))?;
+                        } else {
+                            fs::copy(from, to)
+                                .with_context(|| format!("Failed to copy file across devices: {:?} to {:?}", from, to))?;
+                            fs::remove_file(from)
+                                .with_context(|| format!("Failed to remove source file after cross-device move: {:?}", from))?;
+                        }
+                    } else {
+                        return Err(e).with_context(|| format!("Failed to rename {:?} to {:?}", from, to));
+                    }
+                }
                 undo_log.push(UndoAction::Renamed {
                     from: from.clone(),
                     to: to.clone(),
@@ -122,4 +137,20 @@ fn get_trash_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(home).join(".local/share/Trash"));
     }
     Ok(PathBuf::from("/tmp/Trash"))
+}
+
+/// Recursively copy a directory tree (used as fallback for cross-device moves).
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let dest_path = dst.join(entry.file_name());
+        if entry_path.is_dir() {
+            copy_dir_recursive(&entry_path, &dest_path)?;
+        } else {
+            fs::copy(&entry_path, &dest_path)?;
+        }
+    }
+    Ok(())
 }

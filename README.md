@@ -2,7 +2,7 @@
 There are millions of terminal that uses vim keys but I feel like some parts are missing. So I am trying to create a file manager that acts like a neovim buffer . It takes inspirations from *mini.files*  and *oil.nvim* . I *use mini.fils* heavily in my work so I created this. This is mostly AI genarated now but I plan to read the code and fix any problem that might come or not I don't know. Let's see how this goes from now on.
 
 # Why the name is Euler?
-It's play on the word oil and tibiute [Leonhard Euler](https://en.wikipedia.org/wiki/Leonhard_Euler) .
+It's play on the word oil and tribute [Leonhard Euler](https://en.wikipedia.org/wiki/Leonhard_Euler) .
 
 ---
 * The billow part is AI genarated .
@@ -15,9 +15,10 @@ Instead of interacting with files through rigid cursor selection and single-item
 
 ## Features
 
-- **Buffer-as-Filesystem:** The directory *is* an editable text buffer. Edit file and directory names in place using standard Vim motions.
-- **Persistent Line Tracking (`EntryId`):** Automatically and unambiguously distinguishes renames from deletions and creations.
-- **Safe Diff Review (`:w`):** Pending changes are inspected in an interactive, color-coded diff popup (`+ CREATE`, `~ RENAME`, `→ MOVE`, `- DELETE`) before writing to disk.
+- **Multi-Column Side-by-Side Browsing (mini.files style):** Open and view up to 4 directories in a row horizontally (`[ Grandparent │ Parent │ Current │ Child ]`).
+- **Free Navigation Without Forced Saves:** Move freely between directories and columns using `h` and `l`. In-flight buffer edits in any directory are preserved in memory without blocking or prompting you to commit before leaving.
+- **Buffer-as-Filesystem:** Every open directory column is an editable text buffer. Edit file and directory names in place using standard Vim motions.
+- **Smart Save Workflow (`:w`):** Creates, renames, and moves are applied immediately on `:w` without friction; the confirmation modal appears only if files or directories are being deleted (to trash).
 - **Cycle & Collision Detection:** Safely handles cyclic renames (e.g. `A -> B` and `B -> A`) via staging swaps without data loss.
 - **System Trash Integration:** Deletions default to the system trash following the XDG specification (reversible).
 - **Filesystem Undo / Redo:** Use `u` in Normal mode to roll back committed filesystem batches.
@@ -139,6 +140,9 @@ opener: "xdg-open"
 
 # Strictly disable all arrow keys across the application
 disable_arrow_keys: true
+
+# Highlight the full active line under the cursor (enabled by default)
+cursorline: true
 ```
 
 ---

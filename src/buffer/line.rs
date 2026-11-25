@@ -36,15 +36,19 @@ pub struct BufferLine {
 
     /// Original filesystem metadata (if loaded from disk).
     pub meta: Option<ItemMeta>,
+
+    /// Original absolute filesystem path if this entry originated from disk.
+    pub source_path: Option<PathBuf>,
 }
 
 impl BufferLine {
     /// Create a line representing an existing file or directory on disk.
-    pub fn from_disk(entry_id: EntryId, name: String, meta: ItemMeta) -> Self {
+    pub fn from_disk(entry_id: EntryId, name: String, source_path: PathBuf, meta: ItemMeta) -> Self {
         Self {
             entry_id: Some(entry_id),
             text: name,
             meta: Some(meta),
+            source_path: Some(source_path),
         }
     }
 
@@ -54,15 +58,7 @@ impl BufferLine {
             entry_id: None,
             text: String::new(),
             meta: None,
-        }
-    }
-
-    /// Create a brand new line with initial text.
-    pub fn new_with_text(text: String) -> Self {
-        Self {
-            entry_id: None,
-            text,
-            meta: None,
+            source_path: None,
         }
     }
 
