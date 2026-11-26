@@ -16,3 +16,4 @@
 ```
 1. - [x] Show an Error if xdg-open fails.
 1. - [x] When I undo works per column . That is not the expected behavious. Undo and redo should work on everything. 
+1. - [x] Open a file in a user-specified program with `go`.
