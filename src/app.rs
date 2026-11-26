@@ -284,6 +284,10 @@ impl App {
                 let input_str = input.clone();
                 self.handle_search_mode(key, input_str)?;
             }
+            Mode::OpenWith { input } => {
+                let input_str = input.clone();
+                self.handle_open_with_mode(key, input_str, terminal)?;
+            }
             Mode::ConfirmModal { scroll } => {
                 let s = *scroll;
                 self.handle_confirm_modal(key, s)?;
@@ -430,6 +434,15 @@ impl App {
                             }
                             KeyCode::Char('x') => {
                                 self.open_with_system_opener()?;
+                            }
+                            KeyCode::Char('o') => {
+                                if self.active_buffer().current_line().is_some() {
+                                    self.mode = Mode::OpenWith {
+                                        input: String::new(),
+                                    };
+                                } else {
+                                    self.set_status("No item under cursor to open");
+                                }
                             }
                             _ => {}
                         }
@@ -992,6 +1005,37 @@ impl App {
         Ok(())
     }
 
+    /// Open-With Mode (`go`): prompt for a program name to open the selected item.
+    fn handle_open_with_mode(
+        &mut self,
+        key: KeyEvent,
+        mut input: String,
+        terminal: &mut Terminal,
+    ) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                self.mode = Mode::OpenWith { input };
+            }
+            KeyCode::Char(c) => {
+                input.push(c);
+                self.mode = Mode::OpenWith { input };
+            }
+            KeyCode::Enter => {
+                let program = input.trim().to_string();
+                self.mode = Mode::Normal;
+                if !program.is_empty() {
+                    self.open_in_program(&program, terminal)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Jump to next filename matching search query in active buffer.
     fn jump_to_next_match(&mut self, query: &str) {
         let query_lower = query.to_lowercase();
@@ -1376,6 +1420,94 @@ impl App {
             return self.open_with_system_opener();
         };
 
+        if !self.launch_terminal_program(bin, args, path, terminal, true)? {
+            self.open_with_system_opener()?;
+        }
+        Ok(())
+    }
+
+    /// Open item with system opener (e.g. xdg-open for Enter / 'gx'), reporting errors on failure.
+    fn open_with_system_opener(&mut self) -> Result<()> {
+        let opener_cmd = self.config.opener.clone();
+        self.launch_detached_from_cmd(&opener_cmd, "xdg-open")
+    }
+
+    /// Open the selected item using a user-specified program command (`go`).
+    fn open_in_program(&mut self, program_cmd: &str, terminal: &mut Terminal) -> Result<()> {
+        let Some((target, clean_name)) = self
+            .columns
+            .get(self.active_col)
+            .and_then(|c| c.current_line().map(|l| (c.current_dir.join(l.clean_name()), l.clean_name().to_string())))
+        else {
+            return Ok(());
+        };
+
+        if !target.exists() {
+            self.set_status(format!(
+                "Error: cannot open '{}' (does not exist on disk)",
+                clean_name
+            ));
+            return Ok(());
+        }
+
+        let parts: Vec<String> = program_cmd.split_whitespace().map(String::from).collect();
+        let Some((bin, args)) = parts.split_first() else {
+            return Ok(());
+        };
+
+        if self.is_terminal_program(bin) {
+            self.launch_terminal_program(bin, args, &target, terminal, false)?;
+        } else {
+            self.spawn_detached_program(bin, args, &target);
+        }
+        Ok(())
+    }
+
+    /// Heuristic to detect interactive terminal programs that require suspending the TUI.
+    fn is_terminal_program(&self, bin: &str) -> bool {
+        let bin_name = Path::new(bin)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(bin);
+
+        let configured_editor = self
+            .config
+            .default_editor
+            .split_whitespace()
+            .next()
+            .and_then(|s| Path::new(s).file_name().and_then(|n| n.to_str()))
+            .unwrap_or("");
+
+        (!configured_editor.is_empty() && bin_name == configured_editor)
+            || matches!(
+                bin_name,
+                "vi" | "vim"
+                    | "nvim"
+                    | "nano"
+                    | "micro"
+                    | "hx"
+                    | "helix"
+                    | "kak"
+                    | "pico"
+                    | "joe"
+                    | "ed"
+                    | "less"
+                    | "more"
+                    | "view"
+                    | "man"
+            )
+    }
+
+    /// Suspend TUI, run an interactive terminal program with inherited stdio, and resume cleanly.
+    /// Returns `Ok(false)` when `fallback_on_not_found` is true and the binary was not found.
+    fn launch_terminal_program(
+        &mut self,
+        bin: &str,
+        args: &[String],
+        path: &Path,
+        terminal: &mut Terminal,
+        fallback_on_not_found: bool,
+    ) -> Result<bool> {
         terminal.suspend()?;
 
         let mut cmd = Command::new(bin);
@@ -1391,13 +1523,13 @@ impl App {
 
         match status {
             Ok(s) if !s.success() => {
-                self.set_status(format!("Editor exited with status: {}", s));
+                self.set_status(format!("Error: '{}' exited with {}", bin, s));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.open_with_system_opener()?;
+            Err(e) if fallback_on_not_found && e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
             }
             Err(e) => {
-                self.set_status(format!("Failed to run editor '{}': {}", bin, e));
+                self.set_status(format!("Error: failed to run '{}': {}", bin, e));
             }
             _ => {
                 let show_hidden = self.config.show_hidden;
@@ -1410,69 +1542,73 @@ impl App {
             }
         }
 
+        Ok(true)
+    }
+
+    /// Parse a command string and launch the selected item detached in background.
+    fn launch_detached_from_cmd(&mut self, cmd_str: &str, default_bin: &str) -> Result<()> {
+        let Some((target, clean_name)) = self
+            .columns
+            .get(self.active_col)
+            .and_then(|c| c.current_line().map(|l| (c.current_dir.join(l.clean_name()), l.clean_name().to_string())))
+        else {
+            return Ok(());
+        };
+
+        if !target.exists() {
+            self.set_status(format!(
+                "Error: cannot open '{}' (does not exist on disk)",
+                clean_name
+            ));
+            return Ok(());
+        }
+
+        let parts: Vec<String> = cmd_str.split_whitespace().map(String::from).collect();
+        let (bin, args) = match parts.split_first() {
+            Some((b, a)) => (b.as_str(), a),
+            None => (default_bin, &[][..]),
+        };
+
+        self.spawn_detached_program(bin, args, &target);
         Ok(())
     }
 
-    /// Open item with system opener (e.g. xdg-open for Enter / 'gx'), reporting errors on failure.
-    fn open_with_system_opener(&mut self) -> Result<()> {
-        let active = &self.columns[self.active_col];
-        if let Some(line) = active.current_line() {
-            let target = active.current_dir.join(line.clean_name());
-            if !target.exists() {
-                self.set_status(format!(
-                    "Error: cannot open '{}' (does not exist on disk)",
-                    line.clean_name()
-                ));
-                return Ok(());
+    /// Spawn a program detached in background and report stderr/non-zero failures asynchronously.
+    fn spawn_detached_program(&mut self, bin: &str, args: &[String], target: &Path) {
+        let res = Command::new(bin)
+            .args(args)
+            .arg(target)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+
+        match res {
+            Ok(child) => {
+                self.set_status(format!("Opening with {}...", bin));
+                let tx = self.opener_tx.clone();
+                let bin_name = bin.to_string();
+                std::thread::spawn(move || match child.wait_with_output() {
+                    Ok(output) if !output.status.success() => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let detail = stderr.lines().next().unwrap_or("").trim();
+                        let msg = if detail.is_empty() {
+                            format!("Error: {} exited with {}", bin_name, output.status)
+                        } else {
+                            format!("Error: {} failed: {}", bin_name, detail)
+                        };
+                        let _ = tx.send(msg);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(format!("Error: failed waiting on {}: {}", bin_name, e));
+                    }
+                    _ => {}
+                });
             }
-
-            let parts: Vec<String> = self
-                .config
-                .opener
-                .split_whitespace()
-                .map(String::from)
-                .collect();
-            let (bin, args) = match parts.split_first() {
-                Some((b, a)) => (b.as_str(), a),
-                None => ("xdg-open", &[][..]),
-            };
-
-            let res = Command::new(bin)
-                .args(args)
-                .arg(&target)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .spawn();
-
-            match res {
-                Ok(child) => {
-                    self.set_status(format!("Opening with {}...", bin));
-                    let tx = self.opener_tx.clone();
-                    let bin_name = bin.to_string();
-                    std::thread::spawn(move || match child.wait_with_output() {
-                        Ok(output) if !output.status.success() => {
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            let detail = stderr.lines().next().unwrap_or("").trim();
-                            let msg = if detail.is_empty() {
-                                format!("Error: {} exited with {}", bin_name, output.status)
-                            } else {
-                                format!("Error: {} failed: {}", bin_name, detail)
-                            };
-                            let _ = tx.send(msg);
-                        }
-                        Err(e) => {
-                            let _ = tx.send(format!("Error: failed waiting on {}: {}", bin_name, e));
-                        }
-                        _ => {}
-                    });
-                }
-                Err(e) => {
-                    self.set_status(format!("Error: failed to run '{}': {}", bin, e));
-                }
+            Err(e) => {
+                self.set_status(format!("Error: failed to run '{}': {}", bin, e));
             }
         }
-        Ok(())
     }
 }
 
@@ -1947,6 +2083,54 @@ mod tests {
         assert!(app.redo().unwrap());
         assert!(!temp_dir.join("note.txt").exists());
         assert!(temp_dir.join("sub/moved_note.txt").exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_open_with_user_specified_program() {
+        let temp_dir = std::env::temp_dir().join(format!("euler_go_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        fs::write(temp_dir.join("sample.txt"), "hello").unwrap();
+
+        let config = Config::default();
+        let mut app = App::new(&temp_dir, config).unwrap();
+
+        // Terminal program detection
+        assert!(app.is_terminal_program("vim"));
+        assert!(app.is_terminal_program("/usr/bin/nvim"));
+        assert!(app.is_terminal_program("less"));
+        assert!(!app.is_terminal_program("gimp"));
+        assert!(!app.is_terminal_program("vlc"));
+
+        // Mode::OpenWith name check
+        assert_eq!(
+            Mode::OpenWith {
+                input: "gimp".to_string()
+            }
+            .name(),
+            "OPEN WITH"
+        );
+
+        // Missing program binary reports Error immediately
+        let mut term_dummy_cmd_missing = "nonexistent_app_go_xyz".to_string();
+        app.spawn_detached_program(
+            &term_dummy_cmd_missing,
+            &[],
+            &temp_dir.join("sample.txt"),
+        );
+        let msg = app.status_msg.as_ref().map(|(m, _)| m.as_str()).unwrap_or("");
+        assert!(msg.starts_with("Error:"), "Expected Error status, got: {}", msg);
+
+        // Non-zero exit from user-specified GUI program reports asynchronously via opener_rx
+        term_dummy_cmd_missing = "false".to_string();
+        app.spawn_detached_program(&term_dummy_cmd_missing, &[], &temp_dir.join("sample.txt"));
+        let err = app
+            .opener_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Expected error message from failing program");
+        assert!(err.starts_with("Error:"), "Expected Error message, got: {}", err);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

@@ -18,6 +18,9 @@ pub enum Mode {
     /// Search Mode: bottom search prompt for `/pattern`.
     Search { input: String },
 
+    /// Open-With Mode: bottom prompt (`go`) to open selected item in a user-specified program.
+    OpenWith { input: String },
+
     /// Diff Confirmation Modal: review pending changes across directories before writing to disk.
     ConfirmModal { scroll: usize },
 
@@ -34,6 +37,7 @@ impl Mode {
             Mode::VisualLine { .. } => "VISUAL LINE",
             Mode::Command { .. } => "COMMAND",
             Mode::Search { .. } => "SEARCH",
+            Mode::OpenWith { .. } => "OPEN WITH",
             Mode::ConfirmModal { .. } => "CONFIRM",
             Mode::HelpModal { .. } => "HELP",
         }

@@ -153,6 +153,14 @@ impl Terminal {
             Mode::Search { input } => {
                 queue!(self.stdout, Show, MoveTo(1 + input.chars().count() as u16, cmd_row))?;
             }
+            Mode::OpenWith { input } => {
+                let prompt_len = "Open with: ".chars().count();
+                queue!(
+                    self.stdout,
+                    Show,
+                    MoveTo((prompt_len + input.chars().count()) as u16, cmd_row)
+                )?;
+            }
             _ => {
                 queue!(self.stdout, Hide)?;
             }
@@ -505,6 +513,7 @@ impl Terminal {
             Mode::VisualLine { .. } => (Color::Yellow, Color::Black),
             Mode::Command { .. } => (Color::Magenta, Color::Black),
             Mode::Search { .. } => (Color::Blue, Color::White),
+            Mode::OpenWith { .. } => (Color::Yellow, Color::Black),
             Mode::ConfirmModal { .. } => (Color::Red, Color::White),
             Mode::HelpModal { .. } => (Color::DarkGrey, Color::White),
         };
@@ -579,6 +588,18 @@ impl Terminal {
                     ResetColor
                 )?;
                 printed_len = 1 + input.chars().count();
+            }
+            Mode::OpenWith { input } => {
+                let prompt = "Open with: ";
+                queue!(
+                    self.stdout,
+                    SetForegroundColor(Color::Yellow),
+                    Print(prompt),
+                    SetForegroundColor(Color::White),
+                    Print(input),
+                    ResetColor
+                )?;
+                printed_len = prompt.chars().count() + input.chars().count();
             }
             _ => {
                 if let Some(msg) = status_msg {
@@ -718,7 +739,7 @@ impl Terminal {
     /// Draw help cheatsheet modal.
     fn draw_help_modal(&mut self, _scroll: usize, width: u16, height: u16) -> Result<()> {
         let box_w = 70.min(width as usize);
-        let box_h = 16.min(height as usize);
+        let box_h = 18.min(height as usize);
         let start_x = (width as usize).saturating_sub(box_w) / 2;
         let start_y = (height as usize).saturating_sub(box_h) / 2;
 
@@ -737,6 +758,7 @@ impl Terminal {
             "  u / Ctrl-r      Undo / Redo buffer edits or FS transactions",
             "  g.              Toggle hidden files (dotfiles)",
             "  gx              Open item with xdg-open (system opener)",
+            "  go              Open item in a user-specified program",
             "  :w              Review & commit all changes across open directories",
             "  :q / :q!        Quit / Force quit Euler",
         ];

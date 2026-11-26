@@ -34,6 +34,7 @@ Keybindings (Normal Mode):
     u, Ctrl-r           Undo / Redo buffer edits or FS transactions
     g.                  Toggle hidden files (dotfiles, visible by default)
     gx                  Open item with xdg-open
+    go                  Open item in a user-specified program
     :w                  Review diff and save changes to disk
     :q, :q!             Quit / Force quit
 "#;

@@ -51,6 +51,7 @@ Normal Mode is the primary navigation and command mode.
 | **`N`** | Search | Jump to previous search match | Standard Vim search prev |
 | **`g.`** | Toggle | Toggle visibility of hidden files (`.` dotfiles) | **Visible by default** |
 | **`gx`** | External Opener | **Open file, folder, or target with `xdg-open`** (system default desktop app) | Standard Vim `gx` / system opener |
+| **`go`** | Open With | **Prompt for a program name and open selected file/folder in it** | Opens detached or suspends TUI for terminal apps |
 
 > [!NOTE]
 > `<C-s>` and `<C-c><C-c>` are **disabled**. Saving and reviewing diffs is performed exclusively via **`:w`**.

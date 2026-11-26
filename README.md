@@ -29,6 +29,7 @@ Instead of interacting with files through rigid cursor selection and single-item
   - All arrow keys are explicitly disabled.
   - Hyphen (`-`) is inert.
   - `gx` opens the target with `xdg-open` (system default application).
+  - `go` prompts for a program name and opens the target with that program.
 - **Hidden Files by Default:** Dotfiles are visible by default and can be toggled on/off with `g.`.
 
 ---
@@ -68,8 +69,10 @@ euler --help
 
 | Key | Action |
 | :--- | :--- |
-| **`h`** | Move to parent / previous directory (`..`) *(with dirty buffer guard)* |
-| **`l`** / **`<Enter>`** | Enter directory / open file in `$EDITOR` |
+| **`h`** | Move to parent / previous directory column (left) |
+| **`l`** | Enter directory / open file in `$EDITOR` *(falls back to `xdg-open` if unset)* |
+| **`<Enter>`** | Enter directory / open file with `xdg-open` |
+| **`Ctrl-h`** / **`Ctrl-l`** | Switch active column focus without changing layout |
 | **`j`** / **`k`** | Move cursor down / up |
 | **`w`** / **`b`** | Jump forward / backward by word |
 | **`0`** / **`$`** | Jump to start / end of filename |
@@ -89,6 +92,7 @@ euler --help
 | **`u`** / **`Ctrl-r`** | Undo / Redo buffer edits or committed filesystem transactions |
 | **`g.`** | Toggle hidden files (`.` dotfiles) |
 | **`gx`** | Open selected item with `xdg-open` |
+| **`go`** | Prompt for a program name and open selected item in it |
 | **`:`** | Open command mode (`:w`, `:q`, `:e`, `:help`) |
 | **`/`** | Search filenames (`n` / `N` for next / previous match) |
 
@@ -133,7 +137,7 @@ trash_deletes: true
 # Natural sorting order for filenames
 natural_sort: true
 
-# Editor used when opening files
+# Editor used when opening files (empty falls back to `opener`)
 default_editor: "nvim"
 
 # System desktop opener
