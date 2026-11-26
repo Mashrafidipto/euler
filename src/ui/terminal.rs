@@ -582,13 +582,21 @@ impl Terminal {
             }
             _ => {
                 if let Some(msg) = status_msg {
+                    let is_error = msg.starts_with("Error:")
+                        || msg.starts_with("Failed")
+                        || msg.starts_with("Opener error");
+                    let color = if is_error { Color::Red } else { Color::Yellow };
+                    if is_error {
+                        queue!(self.stdout, SetAttribute(Attribute::Bold))?;
+                    }
                     queue!(
                         self.stdout,
-                        SetForegroundColor(Color::Yellow),
-                        Print(msg),
+                        SetForegroundColor(color),
+                        Print(safe_truncate(msg, width as usize)),
+                        SetAttribute(Attribute::Reset),
                         ResetColor
                     )?;
-                    printed_len = msg.chars().count();
+                    printed_len = msg.chars().count().min(width as usize);
                 }
             }
         }

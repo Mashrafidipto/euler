@@ -14,4 +14,4 @@
     }
 
 ```
-1. - [ ] Show an Error if xdg-open fails.
+1. - [x] Show an Error if xdg-open fails.

@@ -10,6 +10,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 const MAX_COLUMNS: usize = 4;
@@ -38,6 +39,8 @@ pub struct App {
     pub clipboard: Vec<ClipboardItem>,
     pub search_query: Option<String>,
     pub status_msg: Option<(String, Instant)>,
+    pub opener_tx: Sender<String>,
+    pub opener_rx: Receiver<String>,
     pub should_quit: bool,
     pub quit_after_confirm: bool,
 }
@@ -46,6 +49,7 @@ impl App {
     /// Initialize Euler on a target directory, loading multi-column preview.
     pub fn new(path: &Path, config: Config) -> Result<Self> {
         let root_buffer = DirectoryBuffer::load(path, config.show_hidden, config.natural_sort)?;
+        let (opener_tx, opener_rx) = mpsc::channel();
         let mut app = Self {
             columns: vec![root_buffer],
             active_col: 0,
@@ -57,6 +61,8 @@ impl App {
             clipboard: Vec::new(),
             search_query: None,
             status_msg: None,
+            opener_tx,
+            opener_rx,
             should_quit: false,
             quit_after_confirm: false,
         };
@@ -188,6 +194,12 @@ impl App {
         let mut needs_render = true;
 
         while !self.should_quit {
+            // Drain any asynchronous error notifications from background opener processes
+            while let Ok(err_msg) = self.opener_rx.try_recv() {
+                self.set_status(err_msg);
+                needs_render = true;
+            }
+
             let status_msg = self.current_status();
 
             if needs_render {
@@ -1320,25 +1332,63 @@ impl App {
         Ok(())
     }
 
-    /// Open item with system opener (e.g. xdg-open for 'gx').
+    /// Open item with system opener (e.g. xdg-open for Enter / 'gx'), reporting errors on failure.
     fn open_with_system_opener(&mut self) -> Result<()> {
         let active = &self.columns[self.active_col];
         if let Some(line) = active.current_line() {
             let target = active.current_dir.join(line.clean_name());
-            let parts: Vec<&str> = self.config.opener.split_whitespace().collect();
-            let (bin, args) = parts.split_first().unwrap_or((&"xdg-open", &[]));
+            if !target.exists() {
+                self.set_status(format!(
+                    "Error: cannot open '{}' (does not exist on disk)",
+                    line.clean_name()
+                ));
+                return Ok(());
+            }
+
+            let parts: Vec<String> = self
+                .config
+                .opener
+                .split_whitespace()
+                .map(String::from)
+                .collect();
+            let (bin, args) = match parts.split_first() {
+                Some((b, a)) => (b.as_str(), a),
+                None => ("xdg-open", &[][..]),
+            };
 
             let res = Command::new(bin)
                 .args(args)
                 .arg(&target)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
                 .spawn();
 
             match res {
-                Ok(_) => self.set_status(format!("Opened with {}", bin)),
-                Err(e) => self.set_status(format!("Opener error: {}", e)),
+                Ok(child) => {
+                    self.set_status(format!("Opening with {}...", bin));
+                    let tx = self.opener_tx.clone();
+                    let bin_name = bin.to_string();
+                    std::thread::spawn(move || match child.wait_with_output() {
+                        Ok(output) if !output.status.success() => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            let detail = stderr.lines().next().unwrap_or("").trim();
+                            let msg = if detail.is_empty() {
+                                format!("Error: {} exited with {}", bin_name, output.status)
+                            } else {
+                                format!("Error: {} failed: {}", bin_name, detail)
+                            };
+                            let _ = tx.send(msg);
+                        }
+                        Err(e) => {
+                            let _ = tx.send(format!("Error: failed waiting on {}: {}", bin_name, e));
+                        }
+                        _ => {}
+                    });
+                }
+                Err(e) => {
+                    self.set_status(format!("Error: failed to run '{}': {}", bin, e));
+                }
             }
         }
         Ok(())
@@ -1436,6 +1486,7 @@ mod tests {
         let buf_a = DirectoryBuffer::load(&dir_a, config.show_hidden, config.natural_sort).unwrap();
         let buf_b = DirectoryBuffer::load(&dir_b, config.show_hidden, config.natural_sort).unwrap();
 
+        let (opener_tx, opener_rx) = mpsc::channel();
         let mut app = App {
             columns: vec![buf_a, buf_b],
             active_col: 0,
@@ -1447,6 +1498,8 @@ mod tests {
             clipboard: Vec::new(),
             search_query: None,
             status_msg: None,
+            opener_tx,
+            opener_rx,
             should_quit: false,
             quit_after_confirm: false,
         };
@@ -1701,6 +1754,35 @@ mod tests {
         assert_eq!(app.active_col, 1);
         assert_eq!(app.view_offset, 1);
         assert_eq!(app.columns.len(), 5);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_opener_reports_error_on_failure() {
+        let temp_dir = std::env::temp_dir().join(format!("euler_opener_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        fs::write(temp_dir.join("test.txt"), "hello").unwrap();
+
+        // 1. Test missing opener binary reports immediate Error
+        let mut config = Config::default();
+        config.opener = "nonexistent_opener_bin_xyz".to_string();
+        let mut app = App::new(&temp_dir, config).unwrap();
+        app.open_with_system_opener().unwrap();
+        let msg = app.status_msg.as_ref().map(|(m, _)| m.as_str()).unwrap_or("");
+        assert!(msg.starts_with("Error:"), "Expected Error status, got: {}", msg);
+
+        // 2. Test opener exiting non-zero reports Error via background channel
+        let mut config2 = Config::default();
+        config2.opener = "false".to_string();
+        let mut app2 = App::new(&temp_dir, config2).unwrap();
+        app2.open_with_system_opener().unwrap();
+        let err = app2
+            .opener_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Expected error notification from failing opener");
+        assert!(err.starts_with("Error:"), "Expected Error message, got: {}", err);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
