@@ -6,14 +6,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// A snapshot of buffer state for per-edit undo/redo before committing to disk.
-#[derive(Debug, Clone)]
-pub struct BufferSnapshot {
-    pub lines: Vec<BufferLine>,
-    pub cursor_row: usize,
-    pub cursor_col: usize,
-}
-
 /// In-memory representation of a directory as an editable text buffer.
 #[derive(Debug, Clone)]
 pub struct DirectoryBuffer {
@@ -36,10 +28,6 @@ pub struct DirectoryBuffer {
 
     /// Counter used to issue unique EntryIds.
     pub next_id: usize,
-
-    /// In-buffer edit undo/redo stacks (for uncommitted edits like dd, rename, paste).
-    pub edit_undo: Vec<BufferSnapshot>,
-    pub edit_redo: Vec<BufferSnapshot>,
 }
 
 impl DirectoryBuffer {
@@ -140,8 +128,6 @@ impl DirectoryBuffer {
             cursor_col: 0,
             scroll_offset: 0,
             next_id,
-            edit_undo: Vec::new(),
-            edit_redo: Vec::new(),
         })
     }
 
@@ -151,56 +137,8 @@ impl DirectoryBuffer {
         self.baseline = fresh.baseline;
         self.lines = fresh.lines;
         self.next_id = fresh.next_id;
-        self.edit_undo.clear();
-        self.edit_redo.clear();
         self.clamp_cursor_normal();
         Ok(())
-    }
-
-    /// Save current buffer state before an in-buffer edit so `u` can undo it.
-    pub fn push_undo_snapshot(&mut self) {
-        self.edit_undo.push(BufferSnapshot {
-            lines: self.lines.clone(),
-            cursor_row: self.cursor_row,
-            cursor_col: self.cursor_col,
-        });
-        self.edit_redo.clear();
-    }
-
-    /// Undo the most recent in-buffer edit. Returns `true` if a snapshot was restored.
-    pub fn undo_edit(&mut self) -> bool {
-        if let Some(prev) = self.edit_undo.pop() {
-            self.edit_redo.push(BufferSnapshot {
-                lines: self.lines.clone(),
-                cursor_row: self.cursor_row,
-                cursor_col: self.cursor_col,
-            });
-            self.lines = prev.lines;
-            self.cursor_row = prev.cursor_row;
-            self.cursor_col = prev.cursor_col;
-            self.clamp_cursor_normal();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Redo the most recently undone in-buffer edit. Returns `true` if restored.
-    pub fn redo_edit(&mut self) -> bool {
-        if let Some(next) = self.edit_redo.pop() {
-            self.edit_undo.push(BufferSnapshot {
-                lines: self.lines.clone(),
-                cursor_row: self.cursor_row,
-                cursor_col: self.cursor_col,
-            });
-            self.lines = next.lines;
-            self.cursor_row = next.cursor_row;
-            self.cursor_col = next.cursor_col;
-            self.clamp_cursor_normal();
-            true
-        } else {
-            false
-        }
     }
 
     /// Check if the buffer has any uncommitted changes compared to the baseline.

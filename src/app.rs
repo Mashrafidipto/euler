@@ -2,7 +2,7 @@
 
 use crate::buffer::{BufferLine, DirectoryBuffer};
 use crate::config::Config;
-use crate::engine::{compute_diff, execute_plan, FsAction, FsPlan, UndoStack};
+use crate::engine::{compute_diff, execute_plan, FsAction, FsPlan, UndoAction};
 use crate::input::Mode;
 use crate::ui::Terminal;
 use anyhow::Result;
@@ -22,6 +22,20 @@ pub struct ClipboardItem {
     pub is_cut: bool,
 }
 
+/// A single chronological step on Euler's global undo/redo timeline across all columns and disk commits.
+#[derive(Debug, Clone)]
+pub enum GlobalUndoEntry {
+    BufferEdit {
+        columns: Vec<DirectoryBuffer>,
+        active_col: usize,
+        view_offset: usize,
+        clipboard: Vec<ClipboardItem>,
+    },
+    FsCommit {
+        actions: Vec<UndoAction>,
+    },
+}
+
 pub struct App {
     /// Active directory columns open side-by-side (up to 4 in a row like mini.files).
     pub columns: Vec<DirectoryBuffer>,
@@ -35,7 +49,8 @@ pub struct App {
     pub config: Config,
     pub mode: Mode,
     pub pending_plan: Option<FsPlan>,
-    pub undo_stack: UndoStack,
+    pub undo_history: Vec<GlobalUndoEntry>,
+    pub redo_history: Vec<GlobalUndoEntry>,
     pub clipboard: Vec<ClipboardItem>,
     pub search_query: Option<String>,
     pub status_msg: Option<(String, Instant)>,
@@ -57,7 +72,8 @@ impl App {
             config,
             mode: Mode::Normal,
             pending_plan: None,
-            undo_stack: UndoStack::new(),
+            undo_history: Vec::new(),
+            redo_history: Vec::new(),
             clipboard: Vec::new(),
             search_query: None,
             status_msg: None,
@@ -383,7 +399,7 @@ impl App {
 
             // Delete character under cursor: 'x'
             KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::NONE) => {
-                self.active_buffer_mut().push_undo_snapshot();
+                self.push_undo_snapshot();
                 self.active_buffer_mut().delete_char_under();
             }
 
@@ -514,11 +530,11 @@ impl App {
 
             // Entering Insert Mode
             KeyCode::Char('i') => {
-                self.active_buffer_mut().push_undo_snapshot();
+                self.push_undo_snapshot();
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('a') => {
-                self.active_buffer_mut().push_undo_snapshot();
+                self.push_undo_snapshot();
                 if let Some(line) = self.active_buffer().current_line() {
                     let len = line.text.chars().count();
                     self.active_buffer_mut().cursor_col =
@@ -527,24 +543,24 @@ impl App {
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('I') => {
-                self.active_buffer_mut().push_undo_snapshot();
+                self.push_undo_snapshot();
                 self.active_buffer_mut().cursor_col = 0;
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('A') => {
-                self.active_buffer_mut().push_undo_snapshot();
+                self.push_undo_snapshot();
                 if let Some(line) = self.active_buffer().current_line() {
                     self.active_buffer_mut().cursor_col = line.text.chars().count();
                 }
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('o') => {
-                self.active_buffer_mut().push_undo_snapshot();
+                self.push_undo_snapshot();
                 self.active_buffer_mut().insert_line_below();
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('O') => {
-                self.active_buffer_mut().push_undo_snapshot();
+                self.push_undo_snapshot();
                 self.active_buffer_mut().insert_line_above();
                 self.mode = Mode::Insert;
             }
@@ -555,7 +571,7 @@ impl App {
                     if next.kind == KeyEventKind::Press {
                         match next.code {
                             KeyCode::Char('w') => {
-                                self.active_buffer_mut().push_undo_snapshot();
+                                self.push_undo_snapshot();
                                 let cursor_col = self.active_buffer().cursor_col;
                                 if let Some(line) = self.active_buffer_mut().current_line_mut() {
                                     let chars: Vec<char> = line.text.chars().collect();
@@ -572,7 +588,7 @@ impl App {
                                 self.mode = Mode::Insert;
                             }
                             KeyCode::Char('c') => {
-                                self.active_buffer_mut().push_undo_snapshot();
+                                self.push_undo_snapshot();
                                 if let Some(line) = self.active_buffer_mut().current_line_mut() {
                                     line.text.clear();
                                 }
@@ -585,7 +601,7 @@ impl App {
                 }
             }
             KeyCode::Char('C') => {
-                self.active_buffer_mut().push_undo_snapshot();
+                self.push_undo_snapshot();
                 self.active_buffer_mut().delete_to_end_of_line();
                 self.mode = Mode::Insert;
             }
@@ -594,7 +610,7 @@ impl App {
             KeyCode::Char('d') => {
                 if let Ok(Event::Key(next)) = event::read() {
                     if next.kind == KeyEventKind::Press && next.code == KeyCode::Char('d') {
-                        self.active_buffer_mut().push_undo_snapshot();
+                        self.push_undo_snapshot();
                         if let Some(deleted) = self.active_buffer_mut().delete_line() {
                             self.clipboard = vec![ClipboardItem {
                                 line: deleted,
@@ -606,7 +622,7 @@ impl App {
                 }
             }
             KeyCode::Char('D') => {
-                self.active_buffer_mut().push_undo_snapshot();
+                self.push_undo_snapshot();
                 self.active_buffer_mut().delete_to_end_of_line();
             }
 
@@ -638,36 +654,18 @@ impl App {
                 };
             }
 
-            // Undo / Redo: 'u', 'Ctrl-r'
-            // Prefer undoing uncommitted in-buffer edits first (one edit at a time),
-            // then undo committed filesystem transactions.
+            // Global Undo / Redo across all columns & filesystem transactions: 'u', 'Ctrl-r'
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::NONE) => {
-                if self.active_buffer_mut().undo_edit() {
-                    self.ensure_child_preview();
-                    self.set_status("Undid buffer edit");
-                } else if self.undo_stack.undo()? {
-                    self.reload_columns_after_fs_change();
-                    self.set_status("Undid last filesystem change");
-                } else {
-                    self.set_status("Already at oldest change");
-                }
+                self.undo()?;
             }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.active_buffer_mut().redo_edit() {
-                    self.ensure_child_preview();
-                    self.set_status("Redid buffer edit");
-                } else if self.undo_stack.redo()? {
-                    self.reload_columns_after_fs_change();
-                    self.set_status("Redid filesystem change");
-                } else {
-                    self.set_status("Already at newest change");
-                }
+                self.redo()?;
             }
             KeyCode::Char('r') => {
                 if let Ok(Event::Key(next)) = event::read() {
                     if next.kind == KeyEventKind::Press {
                         if let KeyCode::Char(ch) = next.code {
-                            self.active_buffer_mut().push_undo_snapshot();
+                            self.push_undo_snapshot();
                             self.active_buffer_mut().delete_char_under();
                             self.active_buffer_mut().insert_char(ch);
                             self.active_buffer_mut().clamp_cursor_normal();
@@ -763,7 +761,7 @@ impl App {
                     self.mode = Mode::Normal;
                     return Ok(());
                 }
-                self.active_buffer_mut().push_undo_snapshot();
+                self.push_undo_snapshot();
                 let max_row = self.active_buffer().lines.len() - 1;
                 let cur_row = self.active_buffer().cursor_row.min(max_row);
                 let s_row = start_row.min(max_row);
@@ -1123,11 +1121,107 @@ impl App {
         }
     }
 
+    /// Save current global state (all columns, focus, viewport, clipboard) onto the global undo timeline.
+    fn push_undo_snapshot(&mut self) {
+        self.undo_history.push(GlobalUndoEntry::BufferEdit {
+            columns: self.columns.clone(),
+            active_col: self.active_col,
+            view_offset: self.view_offset,
+            clipboard: self.clipboard.clone(),
+        });
+        self.redo_history.clear();
+    }
+
+    /// Global undo across all columns (uncommitted edits first, then committed filesystem changes).
+    fn undo(&mut self) -> Result<bool> {
+        match self.undo_history.pop() {
+            Some(GlobalUndoEntry::BufferEdit {
+                columns,
+                active_col,
+                view_offset,
+                clipboard,
+            }) => {
+                self.redo_history.push(GlobalUndoEntry::BufferEdit {
+                    columns: self.columns.clone(),
+                    active_col: self.active_col,
+                    view_offset: self.view_offset,
+                    clipboard: self.clipboard.clone(),
+                });
+                self.columns = columns;
+                self.active_col = active_col;
+                self.view_offset = view_offset;
+                self.clipboard = clipboard;
+                self.adjust_viewport_for_active_col();
+                self.set_status("Undid edit");
+                Ok(true)
+            }
+            Some(GlobalUndoEntry::FsCommit { actions }) => {
+                for action in actions.iter().rev() {
+                    action.revert()?;
+                }
+                self.redo_history.push(GlobalUndoEntry::FsCommit { actions });
+                self.reload_columns_after_fs_change();
+                self.set_status("Undid last filesystem change");
+                Ok(true)
+            }
+            None => {
+                self.set_status("Already at oldest change");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Global redo across all columns (buffer edits and committed filesystem changes).
+    fn redo(&mut self) -> Result<bool> {
+        match self.redo_history.pop() {
+            Some(GlobalUndoEntry::BufferEdit {
+                columns,
+                active_col,
+                view_offset,
+                clipboard,
+            }) => {
+                self.undo_history.push(GlobalUndoEntry::BufferEdit {
+                    columns: self.columns.clone(),
+                    active_col: self.active_col,
+                    view_offset: self.view_offset,
+                    clipboard: self.clipboard.clone(),
+                });
+                self.columns = columns;
+                self.active_col = active_col;
+                self.view_offset = view_offset;
+                self.clipboard = clipboard;
+                self.adjust_viewport_for_active_col();
+                self.set_status("Redid edit");
+                Ok(true)
+            }
+            Some(GlobalUndoEntry::FsCommit { actions }) => {
+                for action in &actions {
+                    action.reapply()?;
+                }
+                self.undo_history.push(GlobalUndoEntry::FsCommit { actions });
+                self.reload_columns_after_fs_change();
+                self.set_status("Redid filesystem change");
+                Ok(true)
+            }
+            None => {
+                self.set_status("Already at newest change");
+                Ok(false)
+            }
+        }
+    }
+
     /// Commit the given plan to disk and reload all columns safely.
     fn apply_plan(&mut self, plan: FsPlan) -> Result<()> {
         let count = plan.len();
         let undo_batch = execute_plan(&plan, self.config.trash_deletes)?;
-        self.undo_stack.push(undo_batch);
+        if !undo_batch.is_empty() {
+            // Materialized uncommitted buffer edits are now represented by this FsCommit
+            self.undo_history
+                .retain(|e| matches!(e, GlobalUndoEntry::FsCommit { .. }));
+            self.undo_history
+                .push(GlobalUndoEntry::FsCommit { actions: undo_batch });
+            self.redo_history.clear();
+        }
 
         self.reload_columns_after_fs_change();
         self.set_status(format!(
@@ -1195,7 +1289,7 @@ impl App {
             return;
         }
 
-        self.active_buffer_mut().push_undo_snapshot();
+        self.push_undo_snapshot();
         let items = self.clipboard.clone();
 
         for (idx, item) in items.iter().enumerate() {
@@ -1494,7 +1588,8 @@ mod tests {
             config,
             mode: Mode::Normal,
             pending_plan: None,
-            undo_stack: UndoStack::new(),
+            undo_history: Vec::new(),
+            redo_history: Vec::new(),
             clipboard: Vec::new(),
             search_query: None,
             status_msg: None,
@@ -1548,7 +1643,7 @@ mod tests {
         assert_eq!(content, "important data not to be lost");
 
         // 6. Test Undo: 'u' rolls back the move
-        assert!(app.undo_stack.undo().unwrap());
+        assert!(app.undo().unwrap());
         assert!(dir_a.join("document.txt").exists(), "File should be restored to folder_a");
         assert!(!dir_b.join("document.txt").exists(), "File should no longer be in folder_b");
 
@@ -1637,7 +1732,7 @@ mod tests {
         let mut app = App::new(&temp_dir, config).unwrap();
 
         // 1. Delete 'a_file.txt' in buffer (dd)
-        app.active_buffer_mut().push_undo_snapshot();
+        app.push_undo_snapshot();
         let deleted = app.active_buffer_mut().delete_line().unwrap();
         assert_eq!(deleted.clean_name(), "a_file.txt");
         app.clipboard = vec![ClipboardItem {
@@ -1650,21 +1745,21 @@ mod tests {
         assert_eq!(app.columns.len(), 2);
 
         // 2. Rename 'folder1' to 'folder2' in buffer
-        app.active_buffer_mut().push_undo_snapshot();
+        app.push_undo_snapshot();
         app.active_buffer_mut().lines[0].text = "folder2".to_string();
 
         // 3. Pressing undo ('u') first undoes ONLY the rename, NOT the delete!
-        assert!(app.active_buffer_mut().undo_edit());
+        assert!(app.undo().unwrap());
         assert_eq!(app.active_buffer().lines.len(), 1);
         assert_eq!(app.active_buffer().lines[0].clean_name(), "folder1");
 
         // 4. Pressing undo ('u') a second time undoes the delete!
-        assert!(app.active_buffer_mut().undo_edit());
+        assert!(app.undo().unwrap());
         assert_eq!(app.active_buffer().lines.len(), 2);
 
-        // 5. Redo both edits, delete remaining line so buffer is empty, and paste without panicking!
-        assert!(app.active_buffer_mut().redo_edit());
-        app.active_buffer_mut().push_undo_snapshot();
+        // 5. Redo rename? Actually 1st redo redoes delete, then redo rename or delete remaining line:
+        assert!(app.redo().unwrap()); // Redoes dd
+        app.push_undo_snapshot();
         let _ = app.active_buffer_mut().delete_line();
         assert!(app.active_buffer().lines.is_empty());
 
@@ -1684,8 +1779,7 @@ mod tests {
         assert!(temp_dir.join("folder_renamed").exists());
 
         // Undo filesystem rename cleanly restores folder1 and updates columns
-        assert!(app.undo_stack.undo().unwrap());
-        app.reload_columns_after_fs_change();
+        assert!(app.undo().unwrap());
         assert!(temp_dir.join("folder1").exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
@@ -1783,6 +1877,89 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("Expected error notification from failing opener");
         assert!(err.starts_with("Error:"), "Expected Error message, got: {}", err);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_global_undo_redo_across_columns() {
+        let temp_dir = std::env::temp_dir().join(format!("euler_global_undo_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(temp_dir.join("sub")).unwrap();
+        fs::write(temp_dir.join("note.txt"), "important notes").unwrap();
+
+        let config = Config::default();
+        let mut app = App::new(&temp_dir, config).unwrap();
+        // Col 0: [note.txt, sub], Col 1: sub (empty)
+        let sub_pos = app.columns[0]
+            .lines
+            .iter()
+            .position(|l| l.clean_name() == "sub")
+            .unwrap();
+        app.columns[0].cursor_row = sub_pos;
+        app.ensure_child_preview();
+        assert_eq!(app.columns.len(), 2);
+
+        // Step 1: Cut 'note.txt' in Col 0
+        let note_pos = app.columns[0]
+            .lines
+            .iter()
+            .position(|l| l.clean_name() == "note.txt")
+            .unwrap();
+        app.columns[0].cursor_row = note_pos;
+        app.push_undo_snapshot();
+        let deleted = app.active_buffer_mut().delete_line().unwrap();
+        app.clipboard = vec![ClipboardItem {
+            line: deleted,
+            is_cut: true,
+        }];
+
+        // Step 2: Switch to Col 1 (sub) and paste 'note.txt'
+        app.active_col = 1;
+        app.paste_clipboard(true);
+        assert_eq!(app.columns[0].lines.len(), 1);
+        assert_eq!(app.columns[1].lines.len(), 1);
+        assert_eq!(app.columns[1].lines[0].clean_name(), "note.txt");
+
+        // Step 3: Rename in Col 1 to 'moved_note.txt'
+        app.push_undo_snapshot();
+        app.active_buffer_mut().lines[0].text = "moved_note.txt".to_string();
+
+        // Still standing in Col 1: press 'u' 3 times — must undo everything across ALL columns chronologically!
+        assert!(app.undo().unwrap()); // Undoes rename in Col 1
+        assert_eq!(app.columns[1].lines[0].clean_name(), "note.txt");
+
+        assert!(app.undo().unwrap()); // Undoes paste in Col 1 (and restores clipboard cut item!)
+        assert!(app.columns[1].lines.is_empty());
+        assert_eq!(app.clipboard.len(), 1);
+        assert!(app.clipboard[0].is_cut);
+
+        assert!(app.undo().unwrap()); // Undoes dd in Col 0 (jumps focus back to Col 0 and restores note.txt!)
+        assert_eq!(app.active_col, 0);
+        assert_eq!(app.columns[0].lines.len(), 2);
+
+        // Press Ctrl-r 3 times: global redo replays all steps across columns!
+        assert!(app.redo().unwrap()); // Redoes dd in Col 0
+        assert_eq!(app.columns[0].lines.len(), 1);
+        assert!(app.redo().unwrap()); // Redoes paste in Col 1
+        assert_eq!(app.active_col, 1);
+        assert_eq!(app.columns[1].lines[0].clean_name(), "note.txt");
+        assert!(app.redo().unwrap()); // Redoes rename in Col 1
+        assert_eq!(app.columns[1].lines[0].clean_name(), "moved_note.txt");
+
+        // Commit ':w', then test global undo & redo on disk!
+        let plan = app.collect_all_diffs().unwrap();
+        app.apply_plan(plan).unwrap();
+        assert!(!temp_dir.join("note.txt").exists());
+        assert!(temp_dir.join("sub/moved_note.txt").exists());
+
+        assert!(app.undo().unwrap());
+        assert!(temp_dir.join("note.txt").exists());
+        assert!(!temp_dir.join("sub/moved_note.txt").exists());
+
+        assert!(app.redo().unwrap());
+        assert!(!temp_dir.join("note.txt").exists());
+        assert!(temp_dir.join("sub/moved_note.txt").exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

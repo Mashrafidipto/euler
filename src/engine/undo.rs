@@ -75,69 +75,32 @@ impl UndoAction {
         }
         Ok(())
     }
-}
 
-/// Stack maintaining filesystem transaction history.
-#[derive(Debug, Default)]
-pub struct UndoStack {
-    pub history: Vec<Vec<UndoAction>>,
-    pub redo_history: Vec<Vec<UndoAction>>,
-}
-
-impl UndoStack {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Record a successfully executed batch of actions.
-    pub fn push(&mut self, batch: Vec<UndoAction>) {
-        if !batch.is_empty() {
-            self.history.push(batch);
-            self.redo_history.clear();
-        }
-    }
-
-    /// Revert the last applied batch.
-    pub fn undo(&mut self) -> Result<bool> {
-        if let Some(batch) = self.history.pop() {
-            for action in batch.iter().rev() {
-                action.revert()?;
-            }
-            self.redo_history.push(batch);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    /// Re-apply the last undone batch.
-    pub fn redo(&mut self) -> Result<bool> {
-        if let Some(batch) = self.redo_history.pop() {
-            for action in &batch {
-                // To redo:
-                match action {
-                    UndoAction::CreatedFile(path) => {
-                        let _ = fs::File::create(path);
-                    }
-                    UndoAction::CreatedDir(path) => {
-                        let _ = fs::create_dir_all(path);
-                    }
-                    UndoAction::Renamed { from, to } => {
-                        if from.exists() {
-                            let _ = move_path_safe(from, to);
-                        }
-                    }
-                    UndoAction::Trashed { original_path, trash_path } => {
-                        if original_path.exists() {
-                            let _ = move_path_safe(original_path, trash_path);
-                        }
-                    }
+    /// Re-apply a previously reverted action (used for global filesystem redo).
+    pub fn reapply(&self) -> Result<()> {
+        match self {
+            UndoAction::CreatedFile(path) => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if !path.exists() {
+                    fs::File::create(path)?;
                 }
             }
-            self.history.push(batch);
-            Ok(true)
-        } else {
-            Ok(false)
+            UndoAction::CreatedDir(path) => {
+                fs::create_dir_all(path)?;
+            }
+            UndoAction::Renamed { from, to } => {
+                if from.exists() {
+                    move_path_safe(from, to)?;
+                }
+            }
+            UndoAction::Trashed { original_path, trash_path } => {
+                if original_path.exists() {
+                    move_path_safe(original_path, trash_path)?;
+                }
+            }
         }
+        Ok(())
     }
 }
