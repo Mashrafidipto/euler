@@ -63,13 +63,11 @@ impl Config {
         if let Some(mut path) = dirs_config_path() {
             path.push("euler");
             path.push("config.yaml");
-            if path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(config) = serde_yaml::from_str::<Config>(&content) {
+            if path.exists()
+                && let Ok(content) = std::fs::read_to_string(&path)
+                    && let Ok(config) = serde_yaml::from_str::<Config>(&content) {
                         return config;
                     }
-                }
-            }
         }
         Config::default()
     }

@@ -106,11 +106,10 @@ impl App {
 
     /// Check if the status message has expired (after 4 seconds).
     fn current_status(&mut self) -> Option<String> {
-        if let Some((_, time)) = &self.status_msg {
-            if time.elapsed() >= Duration::from_secs(4) {
+        if let Some((_, time)) = &self.status_msg
+            && time.elapsed() >= Duration::from_secs(4) {
                 self.status_msg = None;
             }
-        }
         self.status_msg.as_ref().map(|(msg, _)| msg.clone())
     }
 
@@ -133,15 +132,14 @@ impl App {
             }
         };
 
-        if let Some(child_path) = child_path_opt {
-            if child_path.is_dir() {
+        if let Some(child_path) = child_path_opt
+            && child_path.is_dir() {
                 let next_col = self.active_col + 1;
                 if next_col < self.columns.len() {
                     // Update next column if its path changed and it's not modified
                     if self.columns[next_col].current_dir != child_path
                         && !self.columns[next_col].is_dirty()
-                    {
-                        if let Ok(buf) = DirectoryBuffer::load(
+                        && let Ok(buf) = DirectoryBuffer::load(
                             &child_path,
                             self.config.show_hidden,
                             self.config.natural_sort,
@@ -154,7 +152,6 @@ impl App {
                                 self.columns.truncate(next_col + 1);
                             }
                         }
-                    }
                 } else {
                     // Open as new adjacent column (even beyond 4 so the 4-col viewport can slide right)
                     if let Ok(buf) = DirectoryBuffer::load(
@@ -166,7 +163,6 @@ impl App {
                     }
                 }
             }
-        }
         self.adjust_viewport_for_active_col();
         // Note: When cursor is on a file (child_path_opt is None), do NOT close
         // or truncate adjacent columns. Keep open folders viewable side-by-side.
@@ -405,8 +401,8 @@ impl App {
 
             // 'g' prefix chords
             KeyCode::Char('g') => {
-                if let Ok(Event::Key(next)) = event::read() {
-                    if next.kind == KeyEventKind::Press {
+                if let Ok(Event::Key(next)) = event::read()
+                    && next.kind == KeyEventKind::Press {
                         match next.code {
                             KeyCode::Char('g') => {
                                 self.active_buffer_mut().cursor_row = 0;
@@ -438,7 +434,6 @@ impl App {
                             _ => {}
                         }
                     }
-                }
             }
 
             // Vertical Motions: 'j' and 'k'
@@ -567,8 +562,8 @@ impl App {
 
             // Change operations: 'c' prefix
             KeyCode::Char('c') => {
-                if let Ok(Event::Key(next)) = event::read() {
-                    if next.kind == KeyEventKind::Press {
+                if let Ok(Event::Key(next)) = event::read()
+                    && next.kind == KeyEventKind::Press {
                         match next.code {
                             KeyCode::Char('w') => {
                                 self.push_undo_snapshot();
@@ -598,7 +593,6 @@ impl App {
                             _ => {}
                         }
                     }
-                }
             }
             KeyCode::Char('C') => {
                 self.push_undo_snapshot();
@@ -608,8 +602,8 @@ impl App {
 
             // Deletions: 'dd', 'D'
             KeyCode::Char('d') => {
-                if let Ok(Event::Key(next)) = event::read() {
-                    if next.kind == KeyEventKind::Press && next.code == KeyCode::Char('d') {
+                if let Ok(Event::Key(next)) = event::read()
+                    && next.kind == KeyEventKind::Press && next.code == KeyCode::Char('d') {
                         self.push_undo_snapshot();
                         if let Some(deleted) = self.active_buffer_mut().delete_line() {
                             self.clipboard = vec![ClipboardItem {
@@ -619,7 +613,6 @@ impl App {
                             self.ensure_child_preview();
                         }
                     }
-                }
             }
             KeyCode::Char('D') => {
                 self.push_undo_snapshot();
@@ -628,17 +621,15 @@ impl App {
 
             // Yank & Paste: 'yy', 'p', 'P'
             KeyCode::Char('y') => {
-                if let Ok(Event::Key(next)) = event::read() {
-                    if next.kind == KeyEventKind::Press && next.code == KeyCode::Char('y') {
-                        if let Some(line) = self.active_buffer().current_line() {
+                if let Ok(Event::Key(next)) = event::read()
+                    && next.kind == KeyEventKind::Press && next.code == KeyCode::Char('y')
+                        && let Some(line) = self.active_buffer().current_line() {
                             self.clipboard = vec![ClipboardItem {
                                 line: line.clone(),
                                 is_cut: false,
                             }];
                             self.set_status("Line yanked");
                         }
-                    }
-                }
             }
             KeyCode::Char('p') => {
                 self.paste_clipboard(true);
@@ -662,16 +653,14 @@ impl App {
                 self.redo()?;
             }
             KeyCode::Char('r') => {
-                if let Ok(Event::Key(next)) = event::read() {
-                    if next.kind == KeyEventKind::Press {
-                        if let KeyCode::Char(ch) = next.code {
+                if let Ok(Event::Key(next)) = event::read()
+                    && next.kind == KeyEventKind::Press
+                        && let KeyCode::Char(ch) = next.code {
                             self.push_undo_snapshot();
                             self.active_buffer_mut().delete_char_under();
                             self.active_buffer_mut().insert_char(ch);
                             self.active_buffer_mut().clamp_cursor_normal();
                         }
-                    }
-                }
             }
 
             // Command Mode: ':'
@@ -1075,12 +1064,11 @@ impl App {
                 self.mode = Mode::Normal;
             }
             KeyCode::Char('j') => {
-                if let Some(plan) = &self.pending_plan {
-                    if scroll + 1 < plan.len() {
+                if let Some(plan) = &self.pending_plan
+                    && scroll + 1 < plan.len() {
                         scroll += 1;
                         self.mode = Mode::ConfirmModal { scroll };
                     }
-                }
             }
             KeyCode::Char('k') => {
                 scroll = scroll.saturating_sub(1);
@@ -1118,7 +1106,7 @@ impl App {
             self.columns.push(buf);
             self.active_col += 1;
             self.ensure_child_preview();
-        }
+        };
     }
 
     /// Save current global state (all columns, focus, viewport, clipboard) onto the global undo timeline.
@@ -1272,12 +1260,11 @@ impl App {
         // don't carry stale EntryIds or nonexistent source paths.
         for item in &mut self.clipboard {
             item.line.entry_id = None;
-            if let Some(ref src) = item.line.source_path {
-                if !src.exists() {
+            if let Some(ref src) = item.line.source_path
+                && !src.exists() {
                     item.is_cut = false;
                     item.line.source_path = None;
                 }
-            }
         }
 
         self.ensure_child_preview();

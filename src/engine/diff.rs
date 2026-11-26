@@ -113,8 +113,8 @@ pub fn compute_diff(
                 }
             }
         } else if let Some(id) = line.entry_id {
-            if let Some((original_name, _)) = baseline.get(&id) {
-                if text != original_name {
+            if let Some((original_name, _)) = baseline.get(&id)
+                && text != original_name {
                     let from = current_dir.join(original_name);
                     let to = current_dir.join(text);
 
@@ -125,7 +125,6 @@ pub fn compute_diff(
                         renames.push(FsAction::Rename { from, to });
                     }
                 }
-            }
         } else {
             // New line added by user without source -> Create
             if line.is_dir() {
