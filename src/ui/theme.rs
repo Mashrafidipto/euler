@@ -30,7 +30,7 @@ impl Default for Theme {
             symlink_color: Color::Magenta,
             hidden_color: Color::DarkGrey,
             line_number_color: Color::DarkGrey,
-            cursor_line_bg: Color::AnsiValue(236),
+            cursor_line_bg: Color::AnsiValue(240),
             status_bg: Color::Blue,
             status_fg: Color::Black,
             border_color: Color::Yellow,

@@ -8,7 +8,7 @@ use anyhow::Result;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     execute, queue,
-    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{
         disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
         LeaveAlternateScreen,
@@ -306,6 +306,7 @@ impl Terminal {
                             self.stdout,
                             SetBackgroundColor(self.theme.cursor_line_bg),
                             SetForegroundColor(Color::Yellow),
+                            SetAttribute(Attribute::Bold),
                             Print(&line_num_str)
                         )?;
                     } else {
@@ -364,8 +365,9 @@ impl Terminal {
                             if *mode == Mode::Normal {
                                 queue!(
                                     self.stdout,
-                                    SetBackgroundColor(Color::White),
+                                    SetBackgroundColor(Color::Yellow),
                                     SetForegroundColor(Color::Black),
+                                    SetAttribute(Attribute::Bold),
                                     Print(" "),
                                     SetBackgroundColor(self.theme.cursor_line_bg)
                                 )?;
@@ -376,8 +378,9 @@ impl Terminal {
                                 if *mode == Mode::Normal && c_idx == buf.cursor_col {
                                     queue!(
                                         self.stdout,
-                                        SetBackgroundColor(Color::White),
+                                        SetBackgroundColor(Color::Yellow),
                                         SetForegroundColor(Color::Black),
+                                        SetAttribute(Attribute::Bold),
                                         Print(ch),
                                         SetBackgroundColor(self.theme.cursor_line_bg)
                                     )?;
@@ -386,6 +389,7 @@ impl Terminal {
                                         self.stdout,
                                         SetBackgroundColor(self.theme.cursor_line_bg),
                                         SetForegroundColor(item_color),
+                                        SetAttribute(Attribute::Bold),
                                         Print(ch)
                                     )?;
                                 }
@@ -399,10 +403,11 @@ impl Terminal {
                                 self.stdout,
                                 SetBackgroundColor(self.theme.cursor_line_bg),
                                 Print(" ".repeat(pad)),
+                                SetAttribute(Attribute::Reset),
                                 ResetColor
                             )?;
                         } else {
-                            queue!(self.stdout, ResetColor)?;
+                            queue!(self.stdout, SetAttribute(Attribute::Reset), ResetColor)?;
                         }
                     } else if is_active && is_cursor_row && *mode == Mode::Normal {
                         // Normal mode cursor on active column
@@ -410,9 +415,11 @@ impl Terminal {
                         if chars.is_empty() {
                             queue!(
                                 self.stdout,
-                                SetBackgroundColor(Color::White),
+                                SetBackgroundColor(Color::Yellow),
                                 SetForegroundColor(Color::Black),
+                                SetAttribute(Attribute::Bold),
                                 Print(" "),
+                                SetAttribute(Attribute::Reset),
                                 ResetColor
                             )?;
                             used_cols += 1;
@@ -421,9 +428,11 @@ impl Terminal {
                                 if c_idx == buf.cursor_col {
                                     queue!(
                                         self.stdout,
-                                        SetBackgroundColor(Color::White),
+                                        SetBackgroundColor(Color::Yellow),
                                         SetForegroundColor(Color::Black),
+                                        SetAttribute(Attribute::Bold),
                                         Print(ch),
+                                        SetAttribute(Attribute::Reset),
                                         ResetColor
                                     )?;
                                 } else {
@@ -437,11 +446,11 @@ impl Terminal {
                             queue!(self.stdout, ResetColor, Print(" ".repeat(pad)))?;
                         }
                     } else if !is_active && is_cursor_row {
-                        // Subtle indicator in inactive column to show breadcrumb trail
+                        // Simple, subtle indicator in inactive column to show opened folder breadcrumb
                         queue!(
                             self.stdout,
-                            SetBackgroundColor(Color::DarkBlue),
-                            SetForegroundColor(Color::White)
+                            SetBackgroundColor(Color::AnsiValue(236)),
+                            SetForegroundColor(item_color)
                         )?;
                         let truncated = safe_truncate(&line.text, max_text_cols);
                         queue!(self.stdout, Print(truncated), ResetColor)?;
