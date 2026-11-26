@@ -717,9 +717,9 @@ impl Terminal {
         let title = " Euler Keybinding Cheatsheet ";
         let lines = [
             "  h               Move to parent directory column (left)",
-            "  l               Enter directory / open file with xdg-open",
+            "  l               Enter directory / open file in $EDITOR",
             "  Ctrl-h / Ctrl-l Switch visible pane without changing layout",
-            "  Enter           Enter directory / open file in $EDITOR",
+            "  Enter           Enter directory / open file with xdg-open",
             "  j / k           Move down / up (updates child directory preview)",
             "  w / b / 0 / $   Word forward / backward / line start / line end",
             "  i / a           Insert mode before / after cursor",

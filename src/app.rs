@@ -336,56 +336,32 @@ impl App {
                 }
             }
 
-            // Move to child column (right) or open file with xdg-open
+            // Move to child column (right) or open file in $EDITOR
             KeyCode::Char('l') => {
-                let active = &self.columns[self.active_col];
-                if let Some(line) = active.current_line() {
-                    let target_path = active.current_dir.join(line.clean_name());
-                    if line.is_dir() {
-                        let next_col = self.active_col + 1;
-                        if next_col < self.columns.len() {
-                            // Focus existing child column
-                            self.active_col += 1;
-                            self.ensure_child_preview();
-                        } else if let Ok(buf) = DirectoryBuffer::load(
-                            &target_path,
-                            self.config.show_hidden,
-                            self.config.natural_sort,
-                        ) {
-                            self.columns.push(buf);
-                            self.active_col += 1;
-                            self.ensure_child_preview();
-                        }
+                if let Some((is_dir, target_path)) = self
+                    .columns
+                    .get(self.active_col)
+                    .and_then(|c| c.current_line().map(|l| (l.is_dir(), c.current_dir.join(l.clean_name()))))
+                {
+                    if is_dir {
+                        self.enter_child_dir(&target_path);
                     } else {
-                        // Open file in system opener (xdg-open)
-                        self.open_with_system_opener()?;
+                        self.open_in_editor(&target_path, terminal)?;
                     }
                 }
             }
 
-            // Move to child column (right) or open file in $EDITOR
+            // Move to child column (right) or open file with xdg-open
             KeyCode::Enter => {
-                let active = &self.columns[self.active_col];
-                if let Some(line) = active.current_line() {
-                    let target_path = active.current_dir.join(line.clean_name());
-                    if line.is_dir() {
-                        let next_col = self.active_col + 1;
-                        if next_col < self.columns.len() {
-                            // Focus existing child column
-                            self.active_col += 1;
-                            self.ensure_child_preview();
-                        } else if let Ok(buf) = DirectoryBuffer::load(
-                            &target_path,
-                            self.config.show_hidden,
-                            self.config.natural_sort,
-                        ) {
-                            self.columns.push(buf);
-                            self.active_col += 1;
-                            self.ensure_child_preview();
-                        }
+                if let Some((is_dir, target_path)) = self
+                    .columns
+                    .get(self.active_col)
+                    .and_then(|c| c.current_line().map(|l| (l.is_dir(), c.current_dir.join(l.clean_name()))))
+                {
+                    if is_dir {
+                        self.enter_child_dir(&target_path);
                     } else {
-                        // Open file in user's $EDITOR
-                        self.open_in_editor(&target_path, terminal)?;
+                        self.open_with_system_opener()?;
                     }
                 }
             }
@@ -1117,6 +1093,23 @@ impl App {
     }
 
     // --- Helpers ---
+
+    /// Focus or load the child directory column on the right.
+    fn enter_child_dir(&mut self, target_path: &Path) {
+        let next_col = self.active_col + 1;
+        if next_col < self.columns.len() {
+            self.active_col += 1;
+            self.ensure_child_preview();
+        } else if let Ok(buf) = DirectoryBuffer::load(
+            target_path,
+            self.config.show_hidden,
+            self.config.natural_sort,
+        ) {
+            self.columns.push(buf);
+            self.active_col += 1;
+            self.ensure_child_preview();
+        }
+    }
 
     /// Commit the given plan to disk and reload all columns safely.
     fn apply_plan(&mut self, plan: FsPlan) -> Result<()> {
