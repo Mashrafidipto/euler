@@ -1270,12 +1270,20 @@ impl App {
         self.ensure_child_preview();
     }
 
-    /// Open a file in the user's terminal $EDITOR.
+    /// Open a file in the user's terminal $EDITOR, falling back to `xdg-open` if none is configured.
     fn open_in_editor(&mut self, path: &Path, terminal: &mut Terminal) -> Result<()> {
-        terminal.suspend()?;
+        let parts: Vec<String> = self
+            .config
+            .default_editor
+            .split_whitespace()
+            .map(String::from)
+            .collect();
 
-        let parts: Vec<&str> = self.config.default_editor.split_whitespace().collect();
-        let (bin, args) = parts.split_first().unwrap_or((&"nano", &[]));
+        let Some((bin, args)) = parts.split_first() else {
+            return self.open_with_system_opener();
+        };
+
+        terminal.suspend()?;
 
         let mut cmd = Command::new(bin);
         cmd.args(args);
@@ -1291,6 +1299,9 @@ impl App {
         match status {
             Ok(s) if !s.success() => {
                 self.set_status(format!("Editor exited with status: {}", s));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.open_with_system_opener()?;
             }
             Err(e) => {
                 self.set_status(format!("Failed to run editor '{}': {}", bin, e));

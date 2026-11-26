@@ -18,6 +18,8 @@ pub struct Config {
     pub natural_sort: bool,
 
     /// Default command for opening files in terminal (e.g. "nvim", "vim", "nano").
+    /// When empty, Euler falls back to `opener` (`xdg-open`).
+    #[serde(default)]
     pub default_editor: String,
 
     /// System opener command for `gx` (e.g. "xdg-open", "open").
@@ -33,8 +35,14 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         let editor = std::env::var("EDITOR")
-            .or_else(|_| std::env::var("VISUAL"))
-            .unwrap_or_else(|_| "nano".to_string());
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("VISUAL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .unwrap_or_default();
 
         Self {
             show_hidden: true,
