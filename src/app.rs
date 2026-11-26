@@ -97,7 +97,7 @@ impl App {
         let child_path_opt = {
             let active = &self.columns[self.active_col];
             if let Some(line) = active.current_line() {
-                if line.is_dir() {
+                if line.is_dir() && !line.clean_name().is_empty() {
                     Some(active.current_dir.join(line.clean_name()))
                 } else {
                     None
@@ -175,7 +175,10 @@ impl App {
                 match event::read()? {
                     Event::Key(key) => {
                         if key.kind == KeyEventKind::Press {
-                            self.handle_key(key, terminal)?;
+                            if let Err(e) = self.handle_key(key, terminal) {
+                                self.set_status(format!("Error: {}", e));
+                                self.mode = Mode::Normal;
+                            }
                             needs_render = true;
                         }
                     }
@@ -345,6 +348,7 @@ impl App {
 
             // Delete character under cursor: 'x'
             KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::NONE) => {
+                self.active_buffer_mut().push_undo_snapshot();
                 self.active_buffer_mut().delete_char_under();
             }
 
@@ -423,17 +427,19 @@ impl App {
                 let col = self.active_buffer().cursor_col;
                 if let Some(line) = self.active_buffer().current_line() {
                     let chars: Vec<char> = line.text.chars().collect();
-                    let mut new_col = col;
-                    if new_col > 0 {
-                        new_col -= 1;
-                        while new_col > 0 && chars[new_col].is_whitespace() {
+                    if !chars.is_empty() {
+                        let mut new_col = col.min(chars.len());
+                        if new_col > 0 {
                             new_col -= 1;
+                            while new_col > 0 && chars[new_col].is_whitespace() {
+                                new_col -= 1;
+                            }
+                            while new_col > 0 && !chars[new_col - 1].is_whitespace() {
+                                new_col -= 1;
+                            }
                         }
-                        while new_col > 0 && !chars[new_col - 1].is_whitespace() {
-                            new_col -= 1;
-                        }
+                        self.active_buffer_mut().cursor_col = new_col;
                     }
-                    self.active_buffer_mut().cursor_col = new_col;
                 }
             }
             KeyCode::Char('0') => {
@@ -473,9 +479,11 @@ impl App {
 
             // Entering Insert Mode
             KeyCode::Char('i') => {
+                self.active_buffer_mut().push_undo_snapshot();
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('a') => {
+                self.active_buffer_mut().push_undo_snapshot();
                 if let Some(line) = self.active_buffer().current_line() {
                     let len = line.text.chars().count();
                     self.active_buffer_mut().cursor_col =
@@ -484,20 +492,24 @@ impl App {
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('I') => {
+                self.active_buffer_mut().push_undo_snapshot();
                 self.active_buffer_mut().cursor_col = 0;
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('A') => {
+                self.active_buffer_mut().push_undo_snapshot();
                 if let Some(line) = self.active_buffer().current_line() {
                     self.active_buffer_mut().cursor_col = line.text.chars().count();
                 }
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('o') => {
+                self.active_buffer_mut().push_undo_snapshot();
                 self.active_buffer_mut().insert_line_below();
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('O') => {
+                self.active_buffer_mut().push_undo_snapshot();
                 self.active_buffer_mut().insert_line_above();
                 self.mode = Mode::Insert;
             }
@@ -508,20 +520,24 @@ impl App {
                     if next.kind == KeyEventKind::Press {
                         match next.code {
                             KeyCode::Char('w') => {
+                                self.active_buffer_mut().push_undo_snapshot();
                                 let cursor_col = self.active_buffer().cursor_col;
                                 if let Some(line) = self.active_buffer_mut().current_line_mut() {
                                     let chars: Vec<char> = line.text.chars().collect();
-                                    let mut end = cursor_col;
+                                    let start = cursor_col.min(chars.len());
+                                    let mut end = start;
                                     while end < chars.len() && !chars[end].is_whitespace() {
                                         end += 1;
                                     }
-                                    let mut new_chars = chars[..cursor_col].to_vec();
+                                    let mut new_chars = chars[..start].to_vec();
                                     new_chars.extend_from_slice(&chars[end..]);
                                     line.text = new_chars.into_iter().collect();
+                                    self.active_buffer_mut().cursor_col = start;
                                 }
                                 self.mode = Mode::Insert;
                             }
                             KeyCode::Char('c') => {
+                                self.active_buffer_mut().push_undo_snapshot();
                                 if let Some(line) = self.active_buffer_mut().current_line_mut() {
                                     line.text.clear();
                                 }
@@ -534,6 +550,7 @@ impl App {
                 }
             }
             KeyCode::Char('C') => {
+                self.active_buffer_mut().push_undo_snapshot();
                 self.active_buffer_mut().delete_to_end_of_line();
                 self.mode = Mode::Insert;
             }
@@ -542,6 +559,7 @@ impl App {
             KeyCode::Char('d') => {
                 if let Ok(Event::Key(next)) = event::read() {
                     if next.kind == KeyEventKind::Press && next.code == KeyCode::Char('d') {
+                        self.active_buffer_mut().push_undo_snapshot();
                         if let Some(deleted) = self.active_buffer_mut().delete_line() {
                             self.clipboard = vec![ClipboardItem {
                                 line: deleted,
@@ -553,6 +571,7 @@ impl App {
                 }
             }
             KeyCode::Char('D') => {
+                self.active_buffer_mut().push_undo_snapshot();
                 self.active_buffer_mut().delete_to_end_of_line();
             }
 
@@ -571,59 +590,10 @@ impl App {
                 }
             }
             KeyCode::Char('p') => {
-                let items = self.clipboard.clone();
-                if !items.is_empty() {
-                    for item in &items {
-                        let insert_idx = self.active_buffer().cursor_row + 1;
-                        let mut pasted_line = item.line.clone();
-                        if item.is_cut {
-                            let is_same_dir = pasted_line
-                                .source_path
-                                .as_ref()
-                                .and_then(|p| p.parent())
-                                .map(|p| p == self.active_buffer().current_dir)
-                                .unwrap_or(false);
-
-                            if !is_same_dir {
-                                pasted_line.entry_id = None;
-                            }
-                        } else {
-                            pasted_line.entry_id = None;
-                            pasted_line.source_path = None;
-                        }
-                        self.active_buffer_mut().lines.insert(insert_idx, pasted_line);
-                        self.active_buffer_mut().cursor_row = insert_idx;
-                    }
-                    self.active_buffer_mut().clamp_cursor_normal();
-                    self.ensure_child_preview();
-                }
+                self.paste_clipboard(true);
             }
             KeyCode::Char('P') => {
-                let items = self.clipboard.clone();
-                if !items.is_empty() {
-                    for item in &items {
-                        let insert_idx = self.active_buffer().cursor_row;
-                        let mut pasted_line = item.line.clone();
-                        if item.is_cut {
-                            let is_same_dir = pasted_line
-                                .source_path
-                                .as_ref()
-                                .and_then(|p| p.parent())
-                                .map(|p| p == self.active_buffer().current_dir)
-                                .unwrap_or(false);
-
-                            if !is_same_dir {
-                                pasted_line.entry_id = None;
-                            }
-                        } else {
-                            pasted_line.entry_id = None;
-                            pasted_line.source_path = None;
-                        }
-                        self.active_buffer_mut().lines.insert(insert_idx, pasted_line);
-                    }
-                    self.active_buffer_mut().clamp_cursor_normal();
-                    self.ensure_child_preview();
-                }
+                self.paste_clipboard(false);
             }
 
             // Visual Line Mode: 'V'
@@ -634,21 +604,25 @@ impl App {
             }
 
             // Undo / Redo: 'u', 'Ctrl-r'
+            // Prefer undoing uncommitted in-buffer edits first (one edit at a time),
+            // then undo committed filesystem transactions.
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::NONE) => {
-                if self.undo_stack.undo()? {
-                    for col in &mut self.columns {
-                        let _ = col.reload(self.config.show_hidden, self.config.natural_sort);
-                    }
+                if self.active_buffer_mut().undo_edit() {
+                    self.ensure_child_preview();
+                    self.set_status("Undid buffer edit");
+                } else if self.undo_stack.undo()? {
+                    self.reload_columns_after_fs_change();
                     self.set_status("Undid last filesystem change");
                 } else {
                     self.set_status("Already at oldest change");
                 }
             }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.undo_stack.redo()? {
-                    for col in &mut self.columns {
-                        let _ = col.reload(self.config.show_hidden, self.config.natural_sort);
-                    }
+                if self.active_buffer_mut().redo_edit() {
+                    self.ensure_child_preview();
+                    self.set_status("Redid buffer edit");
+                } else if self.undo_stack.redo()? {
+                    self.reload_columns_after_fs_change();
                     self.set_status("Redid filesystem change");
                 } else {
                     self.set_status("Already at newest change");
@@ -658,6 +632,7 @@ impl App {
                 if let Ok(Event::Key(next)) = event::read() {
                     if next.kind == KeyEventKind::Press {
                         if let KeyCode::Char(ch) = next.code {
+                            self.active_buffer_mut().push_undo_snapshot();
                             self.active_buffer_mut().delete_char_under();
                             self.active_buffer_mut().insert_char(ch);
                             self.active_buffer_mut().clamp_cursor_normal();
@@ -749,10 +724,18 @@ impl App {
                     self.active_buffer().cursor_row.saturating_sub(1);
             }
             KeyCode::Char('d') | KeyCode::Char('x') => {
-                let (low, high) = if start_row <= self.active_buffer().cursor_row {
-                    (start_row, self.active_buffer().cursor_row)
+                if self.active_buffer().lines.is_empty() {
+                    self.mode = Mode::Normal;
+                    return Ok(());
+                }
+                self.active_buffer_mut().push_undo_snapshot();
+                let max_row = self.active_buffer().lines.len() - 1;
+                let cur_row = self.active_buffer().cursor_row.min(max_row);
+                let s_row = start_row.min(max_row);
+                let (low, high) = if s_row <= cur_row {
+                    (s_row, cur_row)
                 } else {
-                    (self.active_buffer().cursor_row, start_row)
+                    (cur_row, s_row)
                 };
 
                 let mut deleted_items = Vec::new();
@@ -773,20 +756,25 @@ impl App {
                 self.ensure_child_preview();
             }
             KeyCode::Char('y') => {
-                let (low, high) = if start_row <= self.active_buffer().cursor_row {
-                    (start_row, self.active_buffer().cursor_row)
-                } else {
-                    (self.active_buffer().cursor_row, start_row)
-                };
+                if !self.active_buffer().lines.is_empty() {
+                    let max_row = self.active_buffer().lines.len() - 1;
+                    let cur_row = self.active_buffer().cursor_row.min(max_row);
+                    let s_row = start_row.min(max_row);
+                    let (low, high) = if s_row <= cur_row {
+                        (s_row, cur_row)
+                    } else {
+                        (cur_row, s_row)
+                    };
 
-                self.clipboard = self.active_buffer().lines[low..=high]
-                    .iter()
-                    .map(|l| ClipboardItem {
-                        line: l.clone(),
-                        is_cut: false,
-                    })
-                    .collect();
-                self.set_status(format!("{} lines yanked", self.clipboard.len()));
+                    self.clipboard = self.active_buffer().lines[low..=high]
+                        .iter()
+                        .map(|l| ClipboardItem {
+                            line: l.clone(),
+                            is_cut: false,
+                        })
+                        .collect();
+                    self.set_status(format!("{} lines yanked", self.clipboard.len()));
+                }
                 self.mode = Mode::Normal;
             }
             _ => {}
@@ -1083,23 +1071,162 @@ impl App {
 
     // --- Helpers ---
 
-    /// Commit the given plan to disk and reload all dirty columns.
+    /// Commit the given plan to disk and reload all columns safely.
     fn apply_plan(&mut self, plan: FsPlan) -> Result<()> {
         let count = plan.len();
         let undo_batch = execute_plan(&plan, self.config.trash_deletes)?;
         self.undo_stack.push(undo_batch);
 
-        // Reload all dirty buffers with fresh state from disk
-        for col in &mut self.columns {
-            let _ = col.reload(self.config.show_hidden, self.config.natural_sort);
-        }
-
+        self.reload_columns_after_fs_change();
         self.set_status(format!(
             "Successfully applied {} changes across directories",
             count
         ));
-        self.ensure_child_preview();
         Ok(())
+    }
+
+    /// Reload open directory columns after a disk transaction (`:w`, `u`, `Ctrl-r`),
+    /// pruning any child columns whose directories were deleted or renamed.
+    fn reload_columns_after_fs_change(&mut self) {
+        let show_hidden = self.config.show_hidden;
+        let natural_sort = self.config.natural_sort;
+
+        let mut valid_len = 0;
+        for col in &mut self.columns {
+            if col.reload(show_hidden, natural_sort).is_ok() {
+                valid_len += 1;
+            } else {
+                break;
+            }
+        }
+
+        if valid_len == 0 && !self.columns.is_empty() {
+            // Walk up to nearest existing parent if column 0 was deleted/renamed
+            let mut probe = self.columns[0].current_dir.clone();
+            while !probe.is_dir() {
+                if let Some(p) = probe.parent() {
+                    probe = p.to_path_buf();
+                } else {
+                    break;
+                }
+            }
+            if let Ok(buf) = DirectoryBuffer::load(&probe, show_hidden, natural_sort) {
+                self.columns = vec![buf];
+            }
+        } else if valid_len < self.columns.len() {
+            self.columns.truncate(valid_len);
+        }
+
+        if !self.columns.is_empty() {
+            self.active_col = self.active_col.min(self.columns.len() - 1);
+        }
+
+        // Refresh clipboard cut state so already-committed or reloaded items
+        // don't carry stale EntryIds or nonexistent source paths.
+        for item in &mut self.clipboard {
+            item.line.entry_id = None;
+            if let Some(ref src) = item.line.source_path {
+                if !src.exists() {
+                    item.is_cut = false;
+                    item.line.source_path = None;
+                }
+            }
+        }
+
+        self.ensure_child_preview();
+    }
+
+    /// Safely paste clipboard items after (`after == true`, 'p') or before ('P') the cursor.
+    fn paste_clipboard(&mut self, after: bool) {
+        if self.clipboard.is_empty() {
+            return;
+        }
+
+        self.active_buffer_mut().push_undo_snapshot();
+        let items = self.clipboard.clone();
+
+        for (idx, item) in items.iter().enumerate() {
+            let mut pasted_line = item.line.clone();
+            let buf_len = self.active_buffer().lines.len();
+            let insert_idx = if after {
+                if buf_len == 0 {
+                    0
+                } else {
+                    (self.active_buffer().cursor_row + 1).min(buf_len)
+                }
+            } else {
+                self.active_buffer().cursor_row.min(buf_len)
+            };
+
+            if item.is_cut {
+                let source_exists = pasted_line
+                    .source_path
+                    .as_ref()
+                    .map(|p| p.exists())
+                    .unwrap_or(false);
+
+                if !source_exists {
+                    // Previously cut item no longer exists at source (already trashed/moved)
+                    pasted_line.entry_id = None;
+                    pasted_line.source_path = None;
+                } else {
+                    let is_same_dir = pasted_line
+                        .source_path
+                        .as_ref()
+                        .and_then(|p| p.parent())
+                        .map(|p| p == self.active_buffer().current_dir)
+                        .unwrap_or(false);
+
+                    // Check if the current buffer already contains a line referencing this source
+                    let already_in_buf = pasted_line.source_path.as_ref().is_some_and(|src| {
+                        self.active_buffer()
+                            .lines
+                            .iter()
+                            .any(|l| l.source_path.as_ref() == Some(src))
+                    });
+
+                    if already_in_buf {
+                        // File was already restored/present; treat extra paste as new entry
+                        pasted_line.entry_id = None;
+                        pasted_line.source_path = None;
+                    } else if !is_same_dir {
+                        pasted_line.entry_id = None;
+                    } else if let Some(id) = pasted_line.entry_id {
+                        // Verify EntryId still matches the same file in baseline after reloads
+                        let matches_baseline = self
+                            .active_buffer()
+                            .baseline
+                            .get(&id)
+                            .map(|(name, _)| {
+                                Some(self.active_buffer().current_dir.join(name))
+                                    == pasted_line.source_path
+                            })
+                            .unwrap_or(false);
+                        if !matches_baseline {
+                            pasted_line.entry_id = None;
+                        }
+                    }
+                }
+            } else {
+                pasted_line.entry_id = None;
+                pasted_line.source_path = None;
+            }
+
+            self.active_buffer_mut().lines.insert(insert_idx, pasted_line);
+            if after {
+                self.active_buffer_mut().cursor_row = insert_idx;
+            }
+
+            // Consume cut flag so pasting a second time doesn't issue duplicate moves
+            if let Some(orig) = self.clipboard.get_mut(idx) {
+                orig.is_cut = false;
+                orig.line.entry_id = None;
+                orig.line.source_path = None;
+            }
+        }
+
+        self.active_buffer_mut().clamp_cursor_normal();
+        self.ensure_child_preview();
     }
 
     /// Open a file in the user's terminal $EDITOR.
@@ -1388,6 +1515,72 @@ mod tests {
         // Previous match 'N' again: moves backward to row 0 ("alpha.txt")
         app.jump_to_prev_match("alpha");
         assert_eq!(app.active_buffer().cursor_row, 0);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_undo_delete_then_rename_and_paste_safety() {
+        let temp_dir = std::env::temp_dir().join(format!("euler_undo_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(temp_dir.join("folder1")).unwrap();
+        fs::write(temp_dir.join("a_file.txt"), "hello").unwrap();
+
+        let mut config = Config::default();
+        config.trash_deletes = false;
+        let mut app = App::new(&temp_dir, config).unwrap();
+
+        // 1. Delete 'a_file.txt' in buffer (dd)
+        app.active_buffer_mut().push_undo_snapshot();
+        let deleted = app.active_buffer_mut().delete_line().unwrap();
+        assert_eq!(deleted.clean_name(), "a_file.txt");
+        app.clipboard = vec![ClipboardItem {
+            line: deleted,
+            is_cut: true,
+        }];
+        app.ensure_child_preview();
+
+        // 'folder1' preview should now be open as column 1
+        assert_eq!(app.columns.len(), 2);
+
+        // 2. Rename 'folder1' to 'folder2' in buffer
+        app.active_buffer_mut().push_undo_snapshot();
+        app.active_buffer_mut().lines[0].text = "folder2".to_string();
+
+        // 3. Pressing undo ('u') first undoes ONLY the rename, NOT the delete!
+        assert!(app.active_buffer_mut().undo_edit());
+        assert_eq!(app.active_buffer().lines.len(), 1);
+        assert_eq!(app.active_buffer().lines[0].clean_name(), "folder1");
+
+        // 4. Pressing undo ('u') a second time undoes the delete!
+        assert!(app.active_buffer_mut().undo_edit());
+        assert_eq!(app.active_buffer().lines.len(), 2);
+
+        // 5. Redo both edits, delete remaining line so buffer is empty, and paste without panicking!
+        assert!(app.active_buffer_mut().redo_edit());
+        app.active_buffer_mut().push_undo_snapshot();
+        let _ = app.active_buffer_mut().delete_line();
+        assert!(app.active_buffer().lines.is_empty());
+
+        // Pasting into an empty buffer with 'p' or 'P' must never panic
+        app.paste_clipboard(true);
+        assert_eq!(app.active_buffer().lines.len(), 1);
+        assert_eq!(app.active_buffer().lines[0].clean_name(), "a_file.txt");
+
+        // 6. Test renaming an open child column folder + apply_plan reloads safely
+        app.reload_columns_after_fs_change();
+        app.active_buffer_mut().cursor_row = 1; // folder1
+        app.ensure_child_preview();
+        assert_eq!(app.columns.len(), 2);
+        app.active_buffer_mut().lines[1].text = "folder_renamed".to_string();
+        let plan = app.collect_all_diffs().unwrap();
+        app.apply_plan(plan).unwrap();
+        assert!(temp_dir.join("folder_renamed").exists());
+
+        // Undo filesystem rename cleanly restores folder1 and updates columns
+        assert!(app.undo_stack.undo().unwrap());
+        app.reload_columns_after_fs_change();
+        assert!(temp_dir.join("folder1").exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

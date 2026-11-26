@@ -6,6 +6,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// A snapshot of buffer state for per-edit undo/redo before committing to disk.
+#[derive(Debug, Clone)]
+pub struct BufferSnapshot {
+    pub lines: Vec<BufferLine>,
+    pub cursor_row: usize,
+    pub cursor_col: usize,
+}
+
 /// In-memory representation of a directory as an editable text buffer.
 #[derive(Debug, Clone)]
 pub struct DirectoryBuffer {
@@ -28,6 +36,10 @@ pub struct DirectoryBuffer {
 
     /// Counter used to issue unique EntryIds.
     pub next_id: usize,
+
+    /// In-buffer edit undo/redo stacks (for uncommitted edits like dd, rename, paste).
+    pub edit_undo: Vec<BufferSnapshot>,
+    pub edit_redo: Vec<BufferSnapshot>,
 }
 
 impl DirectoryBuffer {
@@ -128,6 +140,8 @@ impl DirectoryBuffer {
             cursor_col: 0,
             scroll_offset: 0,
             next_id,
+            edit_undo: Vec::new(),
+            edit_redo: Vec::new(),
         })
     }
 
@@ -137,8 +151,56 @@ impl DirectoryBuffer {
         self.baseline = fresh.baseline;
         self.lines = fresh.lines;
         self.next_id = fresh.next_id;
-        self.clamp_cursor();
+        self.edit_undo.clear();
+        self.edit_redo.clear();
+        self.clamp_cursor_normal();
         Ok(())
+    }
+
+    /// Save current buffer state before an in-buffer edit so `u` can undo it.
+    pub fn push_undo_snapshot(&mut self) {
+        self.edit_undo.push(BufferSnapshot {
+            lines: self.lines.clone(),
+            cursor_row: self.cursor_row,
+            cursor_col: self.cursor_col,
+        });
+        self.edit_redo.clear();
+    }
+
+    /// Undo the most recent in-buffer edit. Returns `true` if a snapshot was restored.
+    pub fn undo_edit(&mut self) -> bool {
+        if let Some(prev) = self.edit_undo.pop() {
+            self.edit_redo.push(BufferSnapshot {
+                lines: self.lines.clone(),
+                cursor_row: self.cursor_row,
+                cursor_col: self.cursor_col,
+            });
+            self.lines = prev.lines;
+            self.cursor_row = prev.cursor_row;
+            self.cursor_col = prev.cursor_col;
+            self.clamp_cursor_normal();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Redo the most recently undone in-buffer edit. Returns `true` if restored.
+    pub fn redo_edit(&mut self) -> bool {
+        if let Some(next) = self.edit_redo.pop() {
+            self.edit_undo.push(BufferSnapshot {
+                lines: self.lines.clone(),
+                cursor_row: self.cursor_row,
+                cursor_col: self.cursor_col,
+            });
+            self.lines = next.lines;
+            self.cursor_row = next.cursor_row;
+            self.cursor_col = next.cursor_col;
+            self.clamp_cursor_normal();
+            true
+        } else {
+            false
+        }
     }
 
     /// Check if the buffer has any uncommitted changes compared to the baseline.
@@ -231,6 +293,7 @@ impl DirectoryBuffer {
             self.cursor_row = 0;
             self.cursor_col = 0;
         }
+        self.clamp_cursor();
 
         let col = self.cursor_col;
         let line = &mut self.lines[self.cursor_row];
@@ -238,28 +301,28 @@ impl DirectoryBuffer {
         let idx = col.min(chars.len());
         chars.insert(idx, c);
         line.text = chars.into_iter().collect();
-        self.cursor_col += 1;
+        self.cursor_col = idx + 1;
     }
 
     /// Delete character before cursor (Backspace).
     pub fn delete_char_before(&mut self) {
-        if self.cursor_col == 0 || self.lines.is_empty() {
+        if self.cursor_col == 0 || self.lines.is_empty() || self.cursor_row >= self.lines.len() {
             return;
         }
 
-        let col = self.cursor_col;
         let line = &mut self.lines[self.cursor_row];
         let mut chars: Vec<char> = line.text.chars().collect();
-        if col <= chars.len() && col > 0 {
+        let col = self.cursor_col.min(chars.len());
+        if col > 0 {
             chars.remove(col - 1);
             line.text = chars.into_iter().collect();
-            self.cursor_col -= 1;
+            self.cursor_col = col - 1;
         }
     }
 
     /// Delete character under cursor (Delete key or 'x' in Normal mode).
     pub fn delete_char_under(&mut self) {
-        if self.lines.is_empty() {
+        if self.lines.is_empty() || self.cursor_row >= self.lines.len() {
             return;
         }
 
@@ -274,13 +337,13 @@ impl DirectoryBuffer {
 
     /// Delete previous word in current line (Ctrl-w in Insert mode).
     pub fn delete_word_before(&mut self) {
-        if self.cursor_col == 0 || self.lines.is_empty() {
+        if self.cursor_col == 0 || self.lines.is_empty() || self.cursor_row >= self.lines.len() {
             return;
         }
 
-        let col = self.cursor_col;
         let line = &mut self.lines[self.cursor_row];
         let chars: Vec<char> = line.text.chars().collect();
+        let col = self.cursor_col.min(chars.len());
 
         let mut idx = col;
         // Skip trailing spaces
@@ -300,17 +363,15 @@ impl DirectoryBuffer {
 
     /// Clear from line start to cursor (Ctrl-u in Insert mode).
     pub fn clear_to_start(&mut self) {
-        if self.cursor_col == 0 || self.lines.is_empty() {
+        if self.cursor_col == 0 || self.lines.is_empty() || self.cursor_row >= self.lines.len() {
             return;
         }
 
-        let col = self.cursor_col;
         let line = &mut self.lines[self.cursor_row];
         let chars: Vec<char> = line.text.chars().collect();
-        if col <= chars.len() {
-            line.text = chars[col..].iter().collect();
-            self.cursor_col = 0;
-        }
+        let col = self.cursor_col.min(chars.len());
+        line.text = chars[col..].iter().collect();
+        self.cursor_col = 0;
     }
 
     /// Insert empty line below current line (Vim 'o' or Enter in insert mode).
@@ -318,7 +379,7 @@ impl DirectoryBuffer {
         let insert_idx = if self.lines.is_empty() {
             0
         } else {
-            self.cursor_row + 1
+            (self.cursor_row + 1).min(self.lines.len())
         };
 
         self.lines.insert(insert_idx, BufferLine::new_empty());
@@ -328,7 +389,7 @@ impl DirectoryBuffer {
 
     /// Insert empty line above current line (Vim 'O').
     pub fn insert_line_above(&mut self) {
-        let insert_idx = self.cursor_row;
+        let insert_idx = self.cursor_row.min(self.lines.len());
         self.lines.insert(insert_idx, BufferLine::new_empty());
         self.cursor_row = insert_idx;
         self.cursor_col = 0;
@@ -336,7 +397,7 @@ impl DirectoryBuffer {
 
     /// Delete current line (Vim 'dd'). Returns the deleted line.
     pub fn delete_line(&mut self) -> Option<BufferLine> {
-        if self.lines.is_empty() {
+        if self.lines.is_empty() || self.cursor_row >= self.lines.len() {
             return None;
         }
 
@@ -350,7 +411,7 @@ impl DirectoryBuffer {
 
     /// Clear text from cursor to end of line (Vim 'D').
     pub fn delete_to_end_of_line(&mut self) {
-        if self.lines.is_empty() {
+        if self.lines.is_empty() || self.cursor_row >= self.lines.len() {
             return;
         }
 

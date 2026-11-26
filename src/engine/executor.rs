@@ -108,9 +108,23 @@ fn move_to_trash(target: &Path) -> Result<PathBuf> {
         counter += 1;
     }
 
-    // Move to trash/files
-    fs::rename(target, &dest_file)
-        .with_context(|| format!("Failed to move {:?} to trash", target))?;
+    // Move to trash/files (with cross-device EXDEV fallback)
+    if let Err(e) = fs::rename(target, &dest_file) {
+        if e.raw_os_error() == Some(18) {
+            if target.is_dir() {
+                copy_dir_recursive(target, &dest_file)?;
+                fs::remove_dir_all(target)
+                    .with_context(|| format!("Failed to remove source dir after trash move: {:?}", target))?;
+            } else {
+                fs::copy(target, &dest_file)
+                    .with_context(|| format!("Failed to copy file to trash: {:?}", target))?;
+                fs::remove_file(target)
+                    .with_context(|| format!("Failed to remove source file after trash move: {:?}", target))?;
+            }
+        } else {
+            return Err(e).with_context(|| format!("Failed to move {:?} to trash", target));
+        }
+    }
 
     // Write .trashinfo file
     let info_file = info_dir.join(format!("{}.trashinfo", base_name));
