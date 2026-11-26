@@ -28,6 +28,9 @@ pub struct App {
     /// Index of the currently focused column (0 <= active_col < columns.len()).
     pub active_col: usize,
 
+    /// Index of the leftmost visible column in the 4-column viewport.
+    pub view_offset: usize,
+
     pub config: Config,
     pub mode: Mode,
     pub pending_plan: Option<FsPlan>,
@@ -46,6 +49,7 @@ impl App {
         let mut app = Self {
             columns: vec![root_buffer],
             active_col: 0,
+            view_offset: 0,
             config,
             mode: Mode::Normal,
             pending_plan: None,
@@ -129,8 +133,8 @@ impl App {
                             }
                         }
                     }
-                } else if self.columns.len() < MAX_COLUMNS {
-                    // Open as new adjacent column
+                } else {
+                    // Open as new adjacent column (even beyond 4 so the 4-col viewport can slide right)
                     if let Ok(buf) = DirectoryBuffer::load(
                         &child_path,
                         self.config.show_hidden,
@@ -141,9 +145,42 @@ impl App {
                 }
             }
         }
+        self.adjust_viewport_for_active_col();
         // Note: When cursor is on a file (child_path_opt is None), do NOT close
         // or truncate adjacent columns. Keep open folders viewable side-by-side.
         // Adjacent columns are only updated when the cursor moves to a new folder.
+    }
+
+    /// Slide the 4-column viewport (`view_offset`) so that when 4 folders are open and
+    /// navigating deeper, the 1st folder hides and the new one shows on the right, keeping
+    /// the active cursor in screen column 2 or 3 whenever adjacent columns exist.
+    fn adjust_viewport_for_active_col(&mut self) {
+        if self.columns.len() <= MAX_COLUMNS {
+            self.view_offset = 0;
+            return;
+        }
+
+        let max_offset = self.columns.len() - MAX_COLUMNS;
+
+        // Moving right onto the 4th visible slot while another folder exists on the right:
+        // shift viewport right so cursor stays in column 3.
+        if self.active_col >= self.view_offset + MAX_COLUMNS - 1 && self.view_offset < max_offset {
+            self.view_offset = (self.active_col + 2 - MAX_COLUMNS).min(max_offset);
+        }
+
+        // Moving left onto the 1st visible slot while parent folders exist to the left:
+        // shift viewport left so cursor stays in column 2.
+        if self.active_col <= self.view_offset && self.view_offset > 0 {
+            self.view_offset = self.active_col.saturating_sub(1);
+        }
+
+        // Hard clamp to keep active_col inside the visible window
+        if self.active_col < self.view_offset {
+            self.view_offset = self.active_col;
+        } else if self.active_col >= self.view_offset + MAX_COLUMNS {
+            self.view_offset = self.active_col + 1 - MAX_COLUMNS;
+        }
+        self.view_offset = self.view_offset.min(max_offset);
     }
 
     /// Main application loop with event-driven rendering.
@@ -158,6 +195,7 @@ impl App {
                 terminal.render(
                     &mut self.columns,
                     self.active_col,
+                    self.view_offset,
                     &self.mode,
                     self.pending_plan.as_ref(),
                     status_msg.as_deref(),
@@ -240,11 +278,25 @@ impl App {
     /// Normal Mode event dispatching.
     fn handle_normal_mode(&mut self, key: KeyEvent, terminal: &mut Terminal) -> Result<()> {
         match key.code {
+            // Ctrl-h / Ctrl-l: move cursor focus between visible columns WITHOUT changing layout
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.active_col > self.view_offset {
+                    self.active_col -= 1;
+                }
+            }
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let visible_end = (self.view_offset + MAX_COLUMNS).min(self.columns.len());
+                if self.active_col + 1 < visible_end {
+                    self.active_col += 1;
+                }
+            }
+
             // Move to previous / parent column (left) without requiring save!
             KeyCode::Char('h') => {
                 if self.active_col > 0 {
                     // Move focus to left column; edits in current column are preserved in memory!
                     self.active_col -= 1;
+                    self.adjust_viewport_for_active_col();
                 } else {
                     // Leftmost column: load parent directory as new leftmost column
                     let parent_opt = self.columns[0]
@@ -275,13 +327,8 @@ impl App {
                             }
 
                             self.columns.insert(0, parent_buf);
-                            // Keep max columns within bounds if rightmost column is not modified
-                            if self.columns.len() > MAX_COLUMNS
-                                && self.columns.last().map(|c| !c.is_dirty()).unwrap_or(false)
-                            {
-                                self.columns.pop();
-                            }
                             self.active_col = 0;
+                            self.view_offset = 0;
                         }
                     } else {
                         self.set_status("Already at root directory.");
@@ -1120,6 +1167,7 @@ impl App {
         if !self.columns.is_empty() {
             self.active_col = self.active_col.min(self.columns.len() - 1);
         }
+        self.adjust_viewport_for_active_col();
 
         // Refresh clipboard cut state so already-committed or reloaded items
         // don't carry stale EntryIds or nonexistent source paths.
@@ -1387,6 +1435,7 @@ mod tests {
         let mut app = App {
             columns: vec![buf_a, buf_b],
             active_col: 0,
+            view_offset: 0,
             config,
             mode: Mode::Normal,
             pending_plan: None,
@@ -1581,6 +1630,73 @@ mod tests {
         assert!(app.undo_stack.undo().unwrap());
         app.reload_columns_after_fs_change();
         assert!(temp_dir.join("folder1").exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_four_column_sliding_and_ctrl_hl() {
+        let temp_dir = std::env::temp_dir().join(format!("euler_slide_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        // Create 5 nested folders: temp_dir / d1 / d2 / d3 / d4 / d5
+        let deepest = temp_dir.join("d1/d2/d3/d4/d5");
+        fs::create_dir_all(&deepest).unwrap();
+
+        let config = Config::default();
+        let mut app = App::new(&temp_dir, config).unwrap();
+
+        // Initially: [temp_dir, d1], active_col = 0, view_offset = 0
+        assert_eq!(app.columns.len(), 2);
+        assert_eq!(app.active_col, 0);
+        assert_eq!(app.view_offset, 0);
+
+        // Move into d1 (opens d2 -> 3 cols)
+        app.active_col = 1;
+        app.ensure_child_preview();
+        assert_eq!(app.columns.len(), 3);
+        assert_eq!(app.view_offset, 0);
+        assert_eq!(app.active_col - app.view_offset, 1); // Column 2 (0-idx 1)
+
+        // Move into d2 (opens d3 -> 4 cols)
+        app.active_col = 2;
+        app.ensure_child_preview();
+        assert_eq!(app.columns.len(), 4);
+        assert_eq!(app.view_offset, 0);
+        assert_eq!(app.active_col - app.view_offset, 2); // Column 3 (0-idx 2)
+
+        // Move into d3 (opens d4 -> 5 cols; 1st folder hides, cursor stays in Column 3!)
+        app.active_col = 3;
+        app.ensure_child_preview();
+        assert_eq!(app.columns.len(), 5);
+        assert_eq!(app.view_offset, 1); // temp_dir hidden, [d1, d2, d3, d4] visible
+        assert_eq!(app.active_col - app.view_offset, 2); // Still Column 3!
+
+        // Move back left with 'h' -> active_col = 2 (Slot 2), view_offset stays 1
+        app.active_col = 2;
+        app.adjust_viewport_for_active_col();
+        assert_eq!(app.view_offset, 1);
+        assert_eq!(app.active_col - app.view_offset, 1); // Column 2!
+
+        // Move back left again with 'h' -> active_col = 1, view_offset shifts to 0
+        app.active_col = 1;
+        app.adjust_viewport_for_active_col();
+        assert_eq!(app.view_offset, 0);
+        assert_eq!(app.active_col - app.view_offset, 1); // Still Column 2!
+
+        // Test Ctrl-h / Ctrl-l: moves active_col within visible columns WITHOUT changing view_offset or layout
+        app.active_col = 3;
+        app.ensure_child_preview();
+        assert_eq!(app.view_offset, 1); // [d1(1), d2(2), d3(3), d4(4)] visible
+        // Ctrl-h twice -> moves to d1 (index 1) without shifting view_offset!
+        if app.active_col > app.view_offset {
+            app.active_col -= 1;
+        }
+        if app.active_col > app.view_offset {
+            app.active_col -= 1;
+        }
+        assert_eq!(app.active_col, 1);
+        assert_eq!(app.view_offset, 1);
+        assert_eq!(app.columns.len(), 5);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

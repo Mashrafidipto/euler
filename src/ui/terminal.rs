@@ -84,6 +84,7 @@ impl Terminal {
         &mut self,
         columns: &mut [DirectoryBuffer],
         active_col: usize,
+        view_offset: usize,
         mode: &Mode,
         pending_plan: Option<&FsPlan>,
         status_msg: Option<&str>,
@@ -110,6 +111,7 @@ impl Terminal {
         let active_col_x = self.draw_columns(
             columns,
             active_col,
+            view_offset,
             mode,
             width,
             content_start_row,
@@ -197,21 +199,20 @@ impl Terminal {
 
     /// Render directory panes side-by-side in columns (up to 4 columns in a row).
     /// Returns the X screen coordinate of the active column.
+    #[allow(clippy::too_many_arguments)]
     fn draw_columns(
         &mut self,
         columns: &mut [DirectoryBuffer],
         active_col: usize,
+        view_offset: usize,
         mode: &Mode,
         width: u16,
         start_row: u16,
         content_height: usize,
     ) -> Result<u16> {
         let max_visible_cols = 4.min(columns.len());
-        let visible_start = if active_col >= max_visible_cols {
-            active_col + 1 - max_visible_cols
-        } else {
-            0
-        };
+        let max_start = columns.len().saturating_sub(max_visible_cols);
+        let visible_start = view_offset.min(max_start);
         let visible_end = (visible_start + max_visible_cols).min(columns.len());
         let num_visible = visible_end - visible_start;
 
@@ -708,6 +709,7 @@ impl Terminal {
         let lines = [
             "  h               Move to parent directory column (left)",
             "  l               Enter directory / open file with xdg-open",
+            "  Ctrl-h / Ctrl-l Switch visible pane without changing layout",
             "  Enter           Enter directory / open file in $EDITOR",
             "  j / k           Move down / up (updates child directory preview)",
             "  w / b / 0 / $   Word forward / backward / line start / line end",
